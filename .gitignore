@@ -1,0 +1,21 @@
+# Maven build output
+target/
+
+# VS Code Java extension (it creates Eclipse-style project files)
+.classpath
+.project
+.settings/
+.factorypath
+bin/
+
+# VS Code / IntelliJ editor settings
+.vscode/
+.idea/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
