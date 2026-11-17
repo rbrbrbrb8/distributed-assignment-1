@@ -7,42 +7,83 @@ import java.util.Arrays;
 import java.util.List;
 
 public class SQSTest {
+
     public static void main(String[] args) throws InterruptedException {
-        SQSService sqs = new SQSService(Region.US_EAST_1);
+        try (SQSService sqs = new SQSService(Region.US_EAST_1)) {
 
-        String testQueueUrl = sqs.getOrCreateQueue("ocr-test-queue-" + System.currentTimeMillis(), 5);
-        System.out.println("Created queue: " + testQueueUrl);
+            // 1. Create the 3 core system queues + 1 dynamic client reply queue
+            String appToManagerUrl = sqs.getOrCreateQueue(SQSService.APP_TO_MANAGER_QUEUE, 30);
+            String managerToWorkersUrl = sqs.getOrCreateQueue(SQSService.MANAGER_TO_WORKERS_QUEUE, 90);
+            String workersToManagerUrl = sqs.getOrCreateQueue(SQSService.WORKERS_TO_MANAGER_QUEUE, 30);
+            String clientReplyUrl = sqs.createClientResponseQueue();
 
-        try {
-            String msg1 = MessageProtocol.createOcrDoneMsg("client-1", "http://img.com/1.jpg", "Line 1\nLine 2");
-            String msg2 = MessageProtocol.createImageTaskMsg("client-1", "http://img.com/2.jpg");
-            sqs.sendMessagesBatch(testQueueUrl, Arrays.asList(msg1, msg2));
-            System.out.println("Sent 2 messages in batch.");
+            System.out.println("Queues created in AWS SQS:");
+            System.out.println(" - App -> Manager:     " + appToManagerUrl);
+            System.out.println(" - Manager -> Workers: " + managerToWorkersUrl);
+            System.out.println(" - Workers -> Manager: " + workersToManagerUrl);
+            System.out.println(" - Client Reply Queue: " + clientReplyUrl);
 
-            List<Message> received = sqs.receiveMessages(testQueueUrl, 1);
-            Message first = received.get(0);
-            String[] parts = MessageProtocol.parse(first.body());
-            System.out.println("Parsed type: " + parts[0]);
-            if (parts[0].equals("OCR_DONE")) {
-                System.out.println("Decoded OCR text:\n" + MessageProtocol.decodeOcrText(parts[3]));
+            // 2. Simulate full assignment message flow
+            String clientId = "client-101";
+
+            // Local App -> Manager: NEW_TASK
+            sqs.sendMessage(appToManagerUrl,
+                    MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt"));
+
+            // Manager -> Workers: Batch of IMAGE_TASK
+            List<String> tasks = Arrays.asList(
+                    MessageProtocol.createImageTaskMsg(clientId, "http://example.com/valid.jpg"),
+                    MessageProtocol.createImageTaskMsg(clientId, "http://example.com/broken.jpg")
+            );
+            sqs.sendMessagesBatch(managerToWorkersUrl, tasks);
+
+            System.out.println("\nTasks waiting in Manager->Workers queue: "
+                    + sqs.getApproximateMessageCount(managerToWorkersUrl));
+
+            // 3. Pause so you can inspect the live queues & messages in AWS Console
+            System.out.println("\n>>> Open AWS SQS Console (us-east-1) now to see the queues and messages (waiting 25s)...");
+            Thread.sleep(25000);
+
+            // 4. Consume and verify messages from each queue
+            Message newTaskMsg = sqs.receiveMessages(appToManagerUrl, 1).get(0);
+            System.out.println("\nManager received: " + Arrays.toString(MessageProtocol.parse(newTaskMsg.body())));
+            sqs.deleteMessage(appToManagerUrl, newTaskMsg);
+
+            List<Message> workerTasks = sqs.receiveMessages(managerToWorkersUrl, 10);
+            for (Message task : workerTasks) {
+                String[] parts = MessageProtocol.parse(task.body());
+                String url = parts[2];
+
+                if (url.contains("valid")) {
+                    sqs.sendMessage(workersToManagerUrl,
+                            MessageProtocol.createOcrDoneMsg(clientId, url, "Extracted Text\nLine 2"));
+                } else {
+                    sqs.sendMessage(workersToManagerUrl,
+                            MessageProtocol.createOcrErrorMsg(clientId, url, "HTTP 404 Not Found"));
+                }
+                sqs.deleteMessage(managerToWorkersUrl, task);
             }
-            sqs.deleteMessage(testQueueUrl, first);
-            System.out.println("Deleted first message.");
 
-            Message second = sqs.receiveMessages(testQueueUrl, 1).get(0);
-            System.out.println("Worker crashed while holding: " + second.body());
+            List<Message> workerResults = sqs.receiveMessages(workersToManagerUrl, 10);
+            for (Message res : workerResults) {
+                String[] parts = MessageProtocol.parse(res.body());
+                if (parts[0].equals(MessageProtocol.MessageType.OCR_DONE.name())) {
+                    System.out.println("Manager got OCR_DONE: " + MessageProtocol.decodeOcrText(parts[3]).replace("\n", " | "));
+                } else {
+                    System.out.println("Manager got OCR_ERROR: " + parts[3]);
+                }
+                sqs.deleteMessage(workersToManagerUrl, res);
+            }
 
-            System.out.println("Waiting 6 seconds for Visibility Timeout to expire...");
-            Thread.sleep(6000);
+            // Manager -> Local App: JOB_DONE
+            sqs.sendMessage(clientReplyUrl, MessageProtocol.createJobDoneMsg("outputs/summary-client-101.txt"));
+            Message jobDone = sqs.receiveMessages(clientReplyUrl, 1).get(0);
+            System.out.println("Local App received: " + Arrays.toString(MessageProtocol.parse(jobDone.body())));
+            sqs.deleteMessage(clientReplyUrl, jobDone);
 
-            List<Message> recovered = sqs.receiveMessages(testQueueUrl, 1);
-            System.out.println("Recovered message after timeout: " + recovered.get(0).body());
-            sqs.deleteMessage(testQueueUrl, recovered.get(0));
-
-        } finally {
-            sqs.deleteQueue(testQueueUrl);
-            sqs.close();
-            System.out.println("Test queue deleted and client closed.");
+            // 5. Cleanup temporary client reply queue (keep the 3 core queues ready, or delete all)
+            sqs.deleteQueue(clientReplyUrl);
+            System.out.println("\nClient reply queue deleted. Core 3 queues remain ready in AWS SQS!");
         }
     }
 }
