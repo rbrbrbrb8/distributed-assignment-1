@@ -1,15 +1,8 @@
-# Maven build output
-target/
-
-# VS Code Java extension (it creates Eclipse-style project files)
-.classpath
-.project
-.settings/
-.factorypath
-bin/
-
-# VS Code / IntelliJ editor settings
-.vscode/
+﻿target/
+*.class
+*.jar
+*.war
+*.ear
 .idea/
 *.iml
 
@@ -25,3 +18,11 @@ Thumbs.db
 
 
 Assignment1.pdf
+.vscode/
+.settings/
+.project
+.classpath
+*.pem
+*.ppk
+credentials
+.env
