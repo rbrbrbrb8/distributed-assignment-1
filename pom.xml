@@ -11,6 +11,7 @@
   <name>distributed-systems-development</name>
 
   <modules>
+    <module>common</module>
     <module>worker</module>
   </modules>
 
@@ -27,6 +28,21 @@
         <version>5.11.0</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>sqs</artifactId>
+        <version>2.57.0</version>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>s3</artifactId>
+        <version>2.57.0</version>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>ec2</artifactId>
+        <version>2.57.0</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
