@@ -20,5 +20,8 @@ Thumbs.db
 # Logs
 *.log
 
+# Local run outputs (e.g. worker-output.txt)
+*-output.txt
+
 
 Assignment1.pdf
