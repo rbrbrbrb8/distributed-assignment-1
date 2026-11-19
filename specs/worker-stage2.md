@@ -154,3 +154,51 @@ Goal of stage 2: the worker runs on EC2 as a long-lived SQS consumer. Its instan
   empty afterwards.
 - Kill test: stop the local worker mid-task, restart it, and the task is processed after the visibility timeout.
 - EC2: the fake-manager run gets results for every sample URL from an EC2 worker, and the instance is terminated.
+
+---
+
+## Results (2026-11-19)
+
+### What was built
+| Piece | Where | Notes |
+|---|---|---|
+| `OcrResult.toMessage(clientId, taskIndex)` | `worker/.../ocr/result/` | `OcrSuccess` → `OCR_DONE`, `OcrFailure` → `OCR_ERROR`, both via `MessageProtocol` |
+| `WorkerLoop` | `worker/.../WorkerLoop.java` | Long-poll 1 message → `processUrl` → send result → **then** delete. Heartbeat extends visibility by 60 s every 30 s. Poison messages are deleted. SQS errors are retried with backoff (1 s → 30 s). |
+| `WorkerApp` (jar main class) | `worker/.../WorkerApp.java` | `java -jar worker.jar` = SQS mode; `java -jar worker.jar local <file>` = debug mode. Shutdown hook waits up to 25 s for the current task. Region from `AWS_REGION` (default `us-east-1`). |
+| `EC2Service` | `common/.../aws/EC2Service.java` | `launch(role, count, amiId, userData)` with the 19-instance cap, `findActive(role)`, `countAllActive()`, `terminate(ids)`. Uses `t3.micro`, `LabInstanceProfile`, tags `Role` + `Name` set at launch. |
+| `UserData.worker(bucket, jarKey)` | `common/.../aws/UserData.java` | Boot script: `/snap/bin/aws s3 cp` the jar to `/opt/ocr`, then `nohup java -jar` (log: `/var/log/worker.log`, bootstrap log: `/var/log/ocr-bootstrap.log`). Bucket and key are validated against shell injection. |
+| `FakeManager` (dev only) | `common/src/test/.../FakeManager.java` | Launches 1 worker, sends a URL file as tasks, collects results by index (no deletes), terminates the worker. |
+
+Tests: 24 unit tests (8 in `common`, 16 in `worker`). None of them call AWS.
+
+### AWS resources (account of the user, `us-east-1`)
+| Resource | Value |
+|---|---|
+| AMI | `ocr-base-ami` = `ami-07f5ffe53445e23b1`: Ubuntu 26.04.1 LTS (x86_64), `openjdk-21-jre-headless` 21.0.13, `tesseract-ocr` 5.5.0, AWS CLI v2 (snap). **No jar inside.** Shared by manager and workers. |
+| Instance type | `t3.micro` |
+| IAM | `LabInstanceProfile` (role `LabRole`). No credentials on instances or in jars. |
+| S3 | `ocr-assignment-c8f120d5`: `jars/worker.jar`, `jars/sample-urls.txt` |
+| SQS | `ocr-manager-to-workers-queue`, `ocr-workers-to-manager-queue` |
+
+### Measured runs
+| Test | Result |
+|---|---|
+| Local worker + real SQS (3 tasks) | 3/3 results with correct client and index; task queue empty afterwards |
+| Kill test (local) | Worker hard-killed mid-task → task stayed in flight, no result → a new worker processed it after the 60 s visibility timeout → exactly one result per index |
+| **EC2, FakeManager, 1 × t3.micro worker, 24 sample URLs** | **24/24 results (12 OK, 12 dead links) in 80 s total**; first result after 55 s (instance boot + jar download); ~25 s of OCR; instance terminated by the code |
+
+### How to re-run the EC2 test
+```
+mvn -pl worker -am package "-Dtest=!SQSTest" -Dsurefire.failIfNoSpecifiedTests=false
+aws s3 cp worker/target/worker-1.0-SNAPSHOT.jar s3://ocr-assignment-c8f120d5/jars/worker.jar
+mvn -q -pl common test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "common/target/classes;common/target/test-classes;$(cat common/target/cp.txt)" \
+     com.distributedsystems.aws.FakeManager ami-07f5ffe53445e23b1 ocr-assignment-c8f120d5 \
+     worker/src/test/resources/sample-urls.txt fake-manager-output.txt
+```
+
+### Notes for the manager (and the README)
+- **Results arrive out of order** (SQS standard queues don't keep order). Place them by task index.
+- **Duplicates are possible** (a worker crash between send and delete, or at-least-once delivery). Ignore a result for an index that is already filled.
+- Visibility timeout: whoever creates `ocr-manager-to-workers-queue` first sets it (the worker uses 60 s, `SQSTest` uses 90 s). Either works, because the heartbeat extends it.
+- The manager reads its own AMI ID from instance metadata and passes it to `EC2Service.launch`.
