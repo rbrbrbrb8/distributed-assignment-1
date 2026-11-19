@@ -23,6 +23,11 @@ public class SQSService implements AutoCloseable {
                 .build();
     }
 
+    // Protected constructor for local in-memory test doubles without AWS credentials
+    protected SQSService() {
+        this.sqsClient = null;
+    }
+
     public String getOrCreateQueue(String queueName, int visibilityTimeoutSeconds) {
         try {
             GetQueueUrlRequest getUrlRequest = GetQueueUrlRequest.builder()
@@ -136,6 +141,8 @@ public class SQSService implements AutoCloseable {
 
     @Override
     public void close() {
-        sqsClient.close();
+        if (sqsClient != null) {
+            sqsClient.close();
+        }
     }
 }

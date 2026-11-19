@@ -1,0 +1,323 @@
+package com.distributedsystems.manager;
+
+import com.distributedsystems.aws.MessageProtocol;
+import com.distributedsystems.aws.SQSService;
+import com.distributedsystems.manager.CloudInterfaces.ComputeClient;
+import com.distributedsystems.manager.CloudInterfaces.StorageClient;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import software.amazon.awssdk.services.sqs.model.Message;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class ManagerLocalTest {
+
+    // --- In-Memory Test Doubles (No AWS connection required) ---
+
+    static class InMemoryStorage implements StorageClient {
+        private final Map<String, String> files = new ConcurrentHashMap<>();
+
+        void putLines(String key, List<String> lines) {
+            files.put(key, String.join("\n", lines));
+        }
+
+        String getRawContent(String key) {
+            return files.get(key);
+        }
+
+        @Override
+        public List<String> downloadLines(String s3Key) {
+            String content = files.get(s3Key);
+            if (content == null) {
+                throw new IllegalArgumentException("Missing key in mock S3: " + s3Key);
+            }
+            return Arrays.asList(content.split("\n"));
+        }
+
+        @Override
+        public void uploadText(String s3Key, String content) {
+            files.put(s3Key, content);
+        }
+    }
+
+    static class InMemoryCompute implements ComputeClient {
+        private final AtomicInteger activeWorkers = new AtomicInteger(0);
+        private final AtomicInteger totalLaunched = new AtomicInteger(0);
+        private final AtomicBoolean workersTerminated = new AtomicBoolean(false);
+        private final AtomicBoolean selfTerminated = new AtomicBoolean(false);
+
+        @Override
+        public int getActiveWorkerCount() {
+            return activeWorkers.get();
+        }
+
+        @Override
+        public void launchWorkers(int count) {
+            activeWorkers.addAndGet(count);
+            totalLaunched.addAndGet(count);
+        }
+
+        @Override
+        public void terminateAllWorkers() {
+            activeWorkers.set(0);
+            workersTerminated.set(true);
+        }
+
+        @Override
+        public void terminateSelf() {
+            selfTerminated.set(true);
+        }
+    }
+
+    static class InMemorySQSService extends SQSService {
+        private final Map<String, BlockingQueue<Message>> queues = new ConcurrentHashMap<>();
+
+        private BlockingQueue<Message> queue(String url) {
+            return queues.computeIfAbsent(url, k -> new LinkedBlockingQueue<>());
+        }
+
+        @Override
+        public void sendMessage(String queueUrl, String messageBody) {
+            queue(queueUrl).offer(Message.builder()
+                    .messageId(UUID.randomUUID().toString())
+                    .receiptHandle(UUID.randomUUID().toString())
+                    .body(messageBody)
+                    .build());
+        }
+
+        @Override
+        public void sendMessagesBatch(String queueUrl, List<String> messages) {
+            for (String msg : messages) {
+                sendMessage(queueUrl, msg);
+            }
+        }
+
+        @Override
+        public List<Message> receiveMessages(String queueUrl, int maxMessages) {
+            BlockingQueue<Message> q = queue(queueUrl);
+            List<Message> batch = new ArrayList<>();
+            try {
+                Message first = q.poll(30, TimeUnit.MILLISECONDS);
+                if (first != null) {
+                    batch.add(first);
+                    q.drainTo(batch, maxMessages - 1);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return batch;
+        }
+
+        @Override
+        public void deleteMessage(String queueUrl, Message message) {
+            // Already removed upon poll/drainTo in local queue
+        }
+    }
+
+    // --- Unit & Integration Tests ---
+
+    @Test
+    void testWorkerScalingFormulaAndCap() {
+        InMemoryCompute compute = new InMemoryCompute();
+        WorkerScaler scaler = new WorkerScaler(compute, 8);
+
+        // ceil(12 / 5) = 3 workers
+        assertEquals(3, scaler.scaleForNewJob(12, 5));
+        assertEquals(3, compute.getActiveWorkerCount());
+
+        // Job needing 2 workers when 3 are already active -> launches 0
+        assertEquals(0, scaler.scaleForNewJob(10, 5));
+        assertEquals(3, compute.getActiveWorkerCount());
+
+        // Job needing ceil(50 / 2) = 25 workers -> capped at maxWorkers (8) -> launches 5 more
+        assertEquals(5, scaler.scaleForNewJob(50, 2));
+        assertEquals(8, compute.getActiveWorkerCount());
+    }
+
+    @Test
+    void testConcurrentScalingThreadSafety() throws InterruptedException {
+        InMemoryCompute compute = new InMemoryCompute();
+        int maxWorkers = 5;
+        WorkerScaler scaler = new WorkerScaler(compute, maxWorkers);
+
+        int threads = 10;
+        CountDownLatch startGate = new CountDownLatch(1);
+        CountDownLatch doneGate = new CountDownLatch(threads);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    startGate.await();
+                    scaler.scaleForNewJob(20, 4);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    doneGate.countDown();
+                }
+            });
+        }
+
+        startGate.countDown();
+        assertTrue(doneGate.await(5, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        assertEquals(maxWorkers, compute.getActiveWorkerCount());
+        assertEquals(maxWorkers, compute.totalLaunched.get());
+    }
+
+    @Test
+    void testClientJobOrderingDuplicatesAndErrors() {
+        // Includes duplicate URL at index 0 and index 2
+        List<String> urls = List.of("http://img/a.png", "http://img/b.png", "http://img/a.png");
+        ClientJob job = new ClientJob("client-1", "resp-q", 2, urls);
+
+        // Out-of-order completion: index 2 arrives first
+        assertFalse(job.recordResult(2, "http://img/a.png", "text-2", false));
+        // Duplicate SQS delivery for index 2 -> must be ignored
+        assertFalse(job.recordResult(2, "http://img/a.png", "text-2", false));
+        assertEquals(2, job.getRemainingTasks());
+
+        // Index 0 fails with OCR error
+        assertFalse(job.recordResult(0, "http://img/a.png", "404 Not Found", true));
+        assertEquals(1, job.getRemainingTasks());
+
+        // Final task (index 1) completes the job
+        assertTrue(job.recordResult(1, "http://img/b.png", "text-1", false));
+        assertEquals(0, job.getRemainingTasks());
+
+        String expectedSummary = String.join("\n",
+                "http://img/a.png | ERROR: 404 Not Found",
+                "http://img/b.png | OCR: text-1",
+                "http://img/a.png | OCR: text-2"
+        );
+        assertEquals(expectedSummary, job.buildSummaryContent());
+    }
+
+    @Test
+    @Timeout(10)
+    void testFullEndToEndManagerFlowWithInMemoryQueues() throws Exception {
+        InMemorySQSService sqs = new InMemorySQSService();
+        InMemoryStorage storage = new InMemoryStorage();
+        InMemoryCompute compute = new InMemoryCompute();
+
+        String appToManager = "app-to-manager";
+        String managerToWorkers = "manager-to-workers";
+        String workersToManager = "workers-to-manager";
+
+        // Prepare input files for two concurrent clients
+        List<String> clientAUrls = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            clientAUrls.add("http://example.com/a-" + i + ".png");
+        }
+        storage.putLines("inputs/client-a.txt", clientAUrls);
+
+        List<String> clientBUrls = List.of(
+                "http://example.com/dup.png",
+                "http://example.com/unique.png",
+                "http://example.com/dup.png"
+        );
+        storage.putLines("inputs/client-b.txt", clientBUrls);
+
+        ManagerEngine engine = new ManagerEngine(
+                sqs, storage, compute, 4,
+                appToManager, managerToWorkers, workersToManager
+        );
+
+        Thread managerThread = new Thread(engine::start, "manager-main");
+        managerThread.start();
+
+        // Submit Client A (12 images, n=4 -> needs 3 workers) and Client B (3 images, n=2 -> needs 2 workers)
+        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-a", "resp-a", "inputs/client-a.txt", 4));
+        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-b", "resp-b", "inputs/client-b.txt", 2));
+
+        // Simulate Workers consuming all 15 IMAGE_TASK messages and posting OCR results
+        int processedTasks = 0;
+        while (processedTasks < 15) {
+            List<Message> tasks = sqs.receiveMessages(managerToWorkers, 10);
+            for (Message taskMsg : tasks) {
+                String[] parts = MessageProtocol.parse(taskMsg.body());
+                assertEquals(MessageProtocol.MessageType.IMAGE_TASK.name(), parts[0]);
+
+                String clientId = parts[1];
+                int taskIndex = MessageProtocol.parseTaskIndex(parts);
+                String url = parts[3];
+
+                if ("client-a".equals(clientId) && taskIndex == 5) {
+                    sqs.sendMessage(workersToManager,
+                            MessageProtocol.createOcrErrorMsg(clientId, taskIndex, url, "Corrupted image header"));
+                } else {
+                    String doneMsg = MessageProtocol.createOcrDoneMsg(
+                            clientId, taskIndex, url, "Text-" + clientId + "-" + taskIndex);
+                    sqs.sendMessage(workersToManager, doneMsg);
+
+                    // Inject a duplicate SQS message for taskIndex 0 to verify idempotency
+                    if (taskIndex == 0) {
+                        sqs.sendMessage(workersToManager, doneMsg);
+                    }
+                }
+                processedTasks++;
+            }
+        }
+
+        // Wait for JOB_DONE notifications on both client response queues
+        Message respA = waitForSingleMessage(sqs, "resp-a");
+        Message respB = waitForSingleMessage(sqs, "resp-b");
+
+        assertEquals(MessageProtocol.createJobDoneMsg("outputs/summary-client-a.txt"), respA.body());
+        assertEquals(MessageProtocol.createJobDoneMsg("outputs/summary-client-b.txt"), respB.body());
+
+        // Verify uploaded S3 summary contents
+        String summaryA = storage.getRawContent("outputs/summary-client-a.txt");
+        assertNotNull(summaryA);
+        String[] linesA = summaryA.split("\n");
+        assertEquals(12, linesA.length);
+        assertEquals("http://example.com/a-5.png | ERROR: Corrupted image header", linesA[5]);
+        assertEquals("http://example.com/a-11.png | OCR: Text-client-a-11", linesA[11]);
+
+        String summaryB = storage.getRawContent("outputs/summary-client-b.txt");
+        assertEquals(String.join("\n",
+                "http://example.com/dup.png | OCR: Text-client-b-0",
+                "http://example.com/unique.png | OCR: Text-client-b-1",
+                "http://example.com/dup.png | OCR: Text-client-b-2"
+        ), summaryB);
+
+        // Verify scaling never exceeded maxWorkers (4)
+        assertTrue(compute.totalLaunched.get() >= 3 && compute.totalLaunched.get() <= 4);
+
+        // Send TERMINATE and verify clean shutdown of workers and manager
+        sqs.sendMessage(appToManager, MessageProtocol.createTerminateMsg());
+        managerThread.join(5000);
+        assertFalse(managerThread.isAlive());
+        assertTrue(compute.workersTerminated.get());
+        assertTrue(compute.selfTerminated.get());
+        assertEquals(0, compute.getActiveWorkerCount());
+    }
+
+    private Message waitForSingleMessage(InMemorySQSService sqs, String queueUrl) {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            List<Message> msgs = sqs.receiveMessages(queueUrl, 1);
+            if (!msgs.isEmpty()) {
+                return msgs.get(0);
+            }
+        }
+        fail("Timed out waiting for message on queue: " + queueUrl);
+        return null;
+    }
+}
