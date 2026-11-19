@@ -78,6 +78,9 @@ Environment: Java 21 and Maven 3.9.16 are installed; tess4j 5.20.0 is already in
 6. `Worker.main` plus `sample-urls.txt`. Run it locally on the sample file.
 7. Add the shade plugin, run `mvn -pl worker package`, then
    `java -jar worker/target/worker-1.0-SNAPSHOT.jar worker/src/test/resources/sample-urls.txt`.
+   > **Update (stage 2):** `main` moved from `Worker` to `WorkerApp`. The jar now starts in SQS mode by default,
+   > so this local run is `java -jar worker/target/worker-1.0-SNAPSHOT.jar local worker/src/test/resources/sample-urls.txt`.
+   > See `specs/worker-stage2.md`.
 8. Commit on `ec2-ocr`, after the user asks.
 
 ### Verification
