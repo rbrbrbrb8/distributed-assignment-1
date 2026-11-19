@@ -177,7 +177,7 @@ Tests: 24 unit tests (8 in `common`, 16 in `worker`). None of them call AWS.
 | AMI | `ocr-base-ami` = `ami-07f5ffe53445e23b1`: Ubuntu 26.04.1 LTS (x86_64), `openjdk-21-jre-headless` 21.0.13, `tesseract-ocr` 5.5.0, AWS CLI v2 (snap). **No jar inside.** Shared by manager and workers. |
 | Instance type | `t3.micro` |
 | IAM | `LabInstanceProfile` (role `LabRole`). No credentials on instances or in jars. |
-| S3 | `ocr-assignment-c8f120d5`: `jars/worker.jar`, `jars/sample-urls.txt` |
+| S3 | `ocr-assignment-c8f120d5`: `jars/worker.jar`, `test-data/sample-urls.txt` (layout: see `specs/s3-service.md`) |
 | SQS | `ocr-manager-to-workers-queue`, `ocr-workers-to-manager-queue` |
 
 ### Measured runs
