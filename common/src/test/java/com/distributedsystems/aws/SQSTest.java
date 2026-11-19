@@ -25,10 +25,11 @@ public class SQSTest {
 
             // 2. Simulate full assignment message flow
             String clientId = "client-101";
+            int expectedN = 5;
 
-            // Local App -> Manager: NEW_TASK
+            // Local App -> Manager: NEW_TASK (including n)
             sqs.sendMessage(appToManagerUrl,
-                    MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt"));
+                    MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt", expectedN));
 
             // Manager -> Workers: Batch of IMAGE_TASK
             List<String> tasks = Arrays.asList(
@@ -46,7 +47,13 @@ public class SQSTest {
 
             // 4. Consume and verify messages from each queue
             Message newTaskMsg = sqs.receiveMessages(appToManagerUrl, 1).get(0);
-            System.out.println("\nManager received: " + Arrays.toString(MessageProtocol.parse(newTaskMsg.body())));
+            String[] newTaskParts = MessageProtocol.parse(newTaskMsg.body());
+            int parsedN = MessageProtocol.parseNewTaskRatio(newTaskParts);
+            System.out.println("\nManager received: " + Arrays.toString(newTaskParts) + " | Parsed n = " + parsedN);
+
+            if (newTaskParts.length != 5 || parsedN != expectedN) {
+                throw new AssertionError("Expected 5 parts with n=" + expectedN + ", but got n=" + parsedN);
+            }
             sqs.deleteMessage(appToManagerUrl, newTaskMsg);
 
             List<Message> workerTasks = sqs.receiveMessages(managerToWorkersUrl, 10);
@@ -80,6 +87,14 @@ public class SQSTest {
             Message jobDone = sqs.receiveMessages(clientReplyUrl, 1).get(0);
             System.out.println("Local App received: " + Arrays.toString(MessageProtocol.parse(jobDone.body())));
             sqs.deleteMessage(clientReplyUrl, jobDone);
+
+            // Verify validation rejects non-positive n
+            try {
+                MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt", 0);
+                throw new AssertionError("Expected IllegalArgumentException for n <= 0");
+            } catch (IllegalArgumentException expected) {
+                System.out.println("Validation check passed: rejected n <= 0");
+            }
 
             // 5. Cleanup temporary client reply queue (keep the 3 core queues ready, or delete all)
             sqs.deleteQueue(clientReplyUrl);

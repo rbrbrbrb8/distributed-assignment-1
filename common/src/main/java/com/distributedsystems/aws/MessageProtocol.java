@@ -17,8 +17,16 @@ public class MessageProtocol {
     }
 
     // 1. Local App -> Manager
-    public static String createNewTaskMsg(String clientId, String responseQueueUrl, String s3InputKey) {
-        return String.join(DELIMITER, MessageType.NEW_TASK.name(), clientId, responseQueueUrl, s3InputKey);
+    public static String createNewTaskMsg(String clientId, String responseQueueUrl, String s3InputKey, int n) {
+        if (n <= 0) {
+            throw new IllegalArgumentException("n (files per worker ratio) must be positive");
+        }
+        return String.join(DELIMITER,
+                MessageType.NEW_TASK.name(),
+                clientId,
+                responseQueueUrl,
+                s3InputKey,
+                String.valueOf(n));
     }
 
     // 2. Local App -> Manager
@@ -60,6 +68,21 @@ public class MessageProtocol {
             throw new IllegalArgumentException("Received empty SQS message");
         }
         return rawBody.split(DELIMITER, -1);
+    }
+
+    public static int parseNewTaskRatio(String[] parts) {
+        if (parts == null || parts.length != 5 || !MessageType.NEW_TASK.name().equals(parts[0])) {
+            throw new IllegalArgumentException("Invalid NEW_TASK message format: expected 5 fields");
+        }
+        try {
+            int n = Integer.parseInt(parts[4]);
+            if (n <= 0) {
+                throw new IllegalArgumentException("n must be positive, got: " + n);
+            }
+            return n;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid integer for n in NEW_TASK: " + parts[4], e);
+        }
     }
 
     public static String decodeOcrText(String encodedText) {
