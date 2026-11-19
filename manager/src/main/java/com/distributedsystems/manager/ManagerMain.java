@@ -3,76 +3,85 @@ package com.distributedsystems.manager;
 import com.distributedsystems.aws.EC2Service;
 import com.distributedsystems.aws.S3Service;
 import com.distributedsystems.aws.SQSService;
+import com.distributedsystems.aws.UserData;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.ec2.Ec2Client;
 
-/**
- * Entry point for the Manager node running on EC2 (or locally for integration testing).
- *
- * <p>Configuration is resolved from CLI arguments or environment variables:
- * <ul>
- *   <li>{@code S3_BUCKET} (or {@code args[0]}): S3 bucket holding input/output files and worker JAR.</li>
- *   <li>{@code WORKER_AMI_ID} (or {@code args[1]}, or auto-detected via IMDSv2): AMI ID for worker instances.</li>
- *   <li>{@code WORKER_JAR_KEY} (optional, defaults to {@code jars/worker.jar}): S3 key of the worker fat JAR.</li>
- *   <li>{@code AWS_REGION} (optional, defaults to {@code us-east-1}): AWS region.</li>
- * </ul>
- */
-public final class ManagerMain {
+import java.util.Objects;
 
-    private static final int QUEUE_VISIBILITY_TIMEOUT_SECONDS = 60;
+public class ManagerMain {
+    private static final int DEFAULT_MAX_WORKERS = 8;
+    private static final int DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 30;
 
-    private ManagerMain() {
+    static final class ManagerSqsService extends SQSService {
+        ManagerSqsService(Region region) {
+            super(region);
+        }
     }
 
     public static void main(String[] args) {
-        Region region = Region.of(System.getenv().getOrDefault("AWS_REGION", "us-east-1"));
+        String bucketName = resolveConfig("S3_BUCKET", args, 0, null);
+        String workerAmiId = resolveConfig("WORKER_AMI_ID", args, 1, null);
+        String workerJarKey = resolveConfig("WORKER_JAR_KEY", args, 2, S3Service.jarKey("worker.jar"));
+        int maxWorkers = parseIntOrDefault(resolveConfig("MAX_WORKERS", args, 3, String.valueOf(DEFAULT_MAX_WORKERS)), DEFAULT_MAX_WORKERS);
+        Region region = resolveRegion();
 
-        String bucketName = args.length >= 1 ? args[0] : System.getenv("S3_BUCKET");
-        if (bucketName == null || bucketName.isBlank()) {
-            System.err.println("Missing required S3 bucket name (set S3_BUCKET env var or pass as args[0]).");
-            System.exit(1);
+        Objects.requireNonNull(bucketName, "S3_BUCKET must be provided via env or args[0]");
+        Objects.requireNonNull(workerAmiId, "WORKER_AMI_ID must be provided via env or args[1]");
+
+        S3Service s3Service = new S3Service(region, bucketName);
+        SQSService sqsService = new ManagerSqsService(region);
+        EC2Service ec2Service = new EC2Service(region);
+        Ec2Client rawEc2Client = Ec2Client.builder().region(region).build();
+
+        String appToManagerUrl = sqsService.getOrCreateQueue(SQSService.APP_TO_MANAGER_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
+        String managerToWorkersUrl = sqsService.getOrCreateQueue(SQSService.MANAGER_TO_WORKERS_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
+        String workersToManagerUrl = sqsService.getOrCreateQueue(SQSService.WORKERS_TO_MANAGER_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
+
+        String workerUserData = UserData.worker(bucketName, workerJarKey);
+
+        S3StorageClient storageClient = new S3StorageClient(s3Service);
+        EC2ComputeClient computeClient = new EC2ComputeClient(ec2Service, rawEc2Client, workerAmiId, workerUserData);
+
+        ManagerEngine engine = new ManagerEngine(
+                sqsService,
+                storageClient,
+                computeClient,
+                maxWorkers,
+                appToManagerUrl,
+                managerToWorkersUrl,
+                workersToManagerUrl
+        );
+
+        System.out.printf("Starting Manager (region=%s, bucket=%s, workerAmi=%s, workerJarKey=%s, maxWorkers=%d)%n",
+                region.id(), bucketName, workerAmiId, workerJarKey, maxWorkers);
+        engine.start();
+    }
+
+    private static Region resolveRegion() {
+        String envRegion = System.getenv("AWS_REGION");
+        if (envRegion != null && !envRegion.isBlank()) {
+            return Region.of(envRegion.trim());
         }
+        return Region.US_EAST_1;
+    }
 
-        String amiId = args.length >= 2 ? args[1] : System.getenv("WORKER_AMI_ID");
-        if (amiId == null || amiId.isBlank()) {
-            amiId = EC2ComputeClient.resolveCurrentAmiId().orElse(null);
+    private static String resolveConfig(String envKey, String[] args, int argIndex, String defaultVal) {
+        String envVal = System.getenv(envKey);
+        if (envVal != null && !envVal.isBlank()) {
+            return envVal.trim();
         }
-        if (amiId == null || amiId.isBlank()) {
-            System.err.println("Missing required WORKER_AMI_ID (set env var, pass as args[1], or run on EC2).");
-            System.exit(1);
+        if (args != null && argIndex < args.length && args[argIndex] != null && !args[argIndex].isBlank()) {
+            return args[argIndex].trim();
         }
+        return defaultVal;
+    }
 
-        String workerJarKey = System.getenv().getOrDefault("WORKER_JAR_KEY", S3Service.jarKey("worker.jar"));
-        int maxWorkers = Math.max(1, EC2Service.MAX_INSTANCES - 1);
-
-        System.out.printf("Starting Manager [region=%s, bucket=%s, amiId=%s, workerJarKey=%s, maxWorkers=%d]%n",
-                region.id(), bucketName, amiId, workerJarKey, maxWorkers);
-
-        try (SQSService sqs = new SQSService(region);
-             S3Service s3 = new S3Service(region, bucketName);
-             EC2Service ec2 = new EC2Service(region)) {
-
-            String appToManagerUrl = sqs.getOrCreateQueue(
-                    SQSService.APP_TO_MANAGER_QUEUE, QUEUE_VISIBILITY_TIMEOUT_SECONDS);
-            String managerToWorkersUrl = sqs.getOrCreateQueue(
-                    SQSService.MANAGER_TO_WORKERS_QUEUE, QUEUE_VISIBILITY_TIMEOUT_SECONDS);
-            String workersToManagerUrl = sqs.getOrCreateQueue(
-                    SQSService.WORKERS_TO_MANAGER_QUEUE, QUEUE_VISIBILITY_TIMEOUT_SECONDS);
-
-            S3StorageClient storageClient = new S3StorageClient(s3);
-            EC2ComputeClient computeClient = new EC2ComputeClient(ec2, amiId, bucketName, workerJarKey);
-
-            ManagerEngine engine = new ManagerEngine(
-                    sqs,
-                    storageClient,
-                    computeClient,
-                    maxWorkers,
-                    appToManagerUrl,
-                    managerToWorkersUrl,
-                    workersToManagerUrl
-            );
-
-            engine.start();
-            System.out.println("Manager shutdown complete.");
+    private static int parseIntOrDefault(String raw, int defaultVal) {
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (Exception e) {
+            return defaultVal;
         }
     }
 }

@@ -1,6 +1,8 @@
 package com.distributedsystems.manager;
 
 import com.distributedsystems.aws.MessageProtocol;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import com.distributedsystems.aws.S3Service;
 import com.distributedsystems.aws.SQSService;
 import com.distributedsystems.manager.CloudInterfaces.ComputeClient;
@@ -11,6 +13,7 @@ import software.amazon.awssdk.services.sqs.model.Message;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -23,7 +26,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -60,6 +62,7 @@ class ManagerLocalTest {
         private final AtomicInteger totalLaunched = new AtomicInteger(0);
         private final AtomicBoolean workersTerminated = new AtomicBoolean(false);
         private final AtomicBoolean selfTerminated = new AtomicBoolean(false);
+        private final List<Integer> activeClientsHistory = Collections.synchronizedList(new ArrayList<>());
 
         @Override
         public int getActiveWorkerCount() {
@@ -81,6 +84,11 @@ class ManagerLocalTest {
         @Override
         public void terminateSelf() {
             selfTerminated.set(true);
+        }
+
+        @Override
+        public void updateActiveClients(int activeClientCount) {
+            activeClientsHistory.add(activeClientCount);
         }
     }
 
@@ -176,7 +184,7 @@ class ManagerLocalTest {
     }
 
     @Test
-    void testClientJobOrderingDuplicatesAndErrors() {
+    void testClientJobSingleLineBase64OrderingDuplicatesAndErrors() {
         List<String> urls = List.of("http://img/a.png", "http://img/b.png", "http://img/a.png");
         ClientJob job = new ClientJob("client-1", "resp-q", 2, urls);
 
@@ -187,15 +195,24 @@ class ManagerLocalTest {
         assertFalse(job.recordResult(0, "http://img/a.png", "404 Not Found", true));
         assertEquals(1, job.getRemainingTasks());
 
-        assertTrue(job.recordResult(1, "http://img/b.png", "text-1\nsecond line", false));
+        assertTrue(job.recordResult(1, "http://img/b.png", "line1\nline2", false));
         assertEquals(0, job.getRemainingTasks());
 
-        String expectedSummary = String.join(ClientJob.ENTRY_DELIMITER,
-                "http://img/a.png | ERROR: 404 Not Found",
-                "http://img/b.png | OCR: text-1\nsecond line",
-                "http://img/a.png | OCR: text-2"
-        );
-        assertEquals(expectedSummary, job.buildSummaryContent());
+        String summary = job.buildSummaryContent();
+        String[] lines = summary.split("\n", -1);
+        assertEquals(3, lines.length);
+
+        String[] line0 = lines[0].split(" \\| ERROR: ", 2);
+        assertEquals("http://img/a.png", line0[0]);
+        assertEquals("404 Not Found", MessageProtocol.decodeOcrText(line0[1]));
+
+        String[] line1 = lines[1].split(" \\| OCR: ", 2);
+        assertEquals("http://img/b.png", line1[0]);
+        assertEquals("line1\nline2", MessageProtocol.decodeOcrText(line1[1]));
+
+        String[] line2 = lines[2].split(" \\| OCR: ", 2);
+        assertEquals("http://img/a.png", line2[0]);
+        assertEquals("text-2", MessageProtocol.decodeOcrText(line2[1]));
     }
 
     @Test
@@ -254,7 +271,7 @@ class ManagerLocalTest {
                             MessageProtocol.createOcrErrorMsg(clientId, taskIndex, url, "Corrupted image header"));
                 } else {
                     String doneMsg = MessageProtocol.createOcrDoneMsg(
-                            clientId, taskIndex, url, "Text-" + clientId + "-" + taskIndex);
+                            clientId, taskIndex, url, "Line1-" + clientId + "-" + taskIndex + "\nLine2");
                     sqs.sendMessage(workersToManager, doneMsg);
 
                     if (taskIndex == 0) {
@@ -273,19 +290,21 @@ class ManagerLocalTest {
 
         String summaryA = storage.getRawContent(expectedSummaryKeyA);
         assertNotNull(summaryA);
-        String[] entriesA = summaryA.split(Pattern.quote(ClientJob.ENTRY_DELIMITER));
+        String[] entriesA = summaryA.split("\n", -1);
         assertEquals(12, entriesA.length);
-        assertEquals("http://example.com/a-5.png | ERROR: Corrupted image header", entriesA[5]);
-        assertEquals("http://example.com/a-11.png | OCR: Text-client-a-11", entriesA[11]);
+        assertEquals("http://example.com/a-5.png | ERROR: " + Base64.getEncoder().encodeToString(("Corrupted image header").getBytes(StandardCharsets.UTF_8)), entriesA[5]);
+        assertEquals("http://example.com/a-11.png | OCR: " + Base64.getEncoder().encodeToString(("Line1-client-a-11\nLine2").getBytes(StandardCharsets.UTF_8)), entriesA[11]);
 
         String summaryB = storage.getRawContent(expectedSummaryKeyB);
-        assertEquals(String.join(ClientJob.ENTRY_DELIMITER,
-                "http://example.com/dup.png | OCR: Text-client-b-0",
-                "http://example.com/unique.png | OCR: Text-client-b-1",
-                "http://example.com/dup.png | OCR: Text-client-b-2"
+        assertEquals(String.join("\n",
+                "http://example.com/dup.png | OCR: " + Base64.getEncoder().encodeToString(("Line1-client-b-0\nLine2").getBytes(StandardCharsets.UTF_8)),
+                "http://example.com/unique.png | OCR: " + Base64.getEncoder().encodeToString(("Line1-client-b-1\nLine2").getBytes(StandardCharsets.UTF_8)),
+                "http://example.com/dup.png | OCR: " + Base64.getEncoder().encodeToString(("Line1-client-b-2\nLine2").getBytes(StandardCharsets.UTF_8))
         ), summaryB);
 
         assertTrue(compute.totalLaunched.get() >= 3 && compute.totalLaunched.get() <= 4);
+        assertTrue(compute.activeClientsHistory.contains(0));
+        assertEquals(0, compute.activeClientsHistory.get(compute.activeClientsHistory.size() - 1));
 
         sqs.sendMessage(appToManager, MessageProtocol.createTerminateMsg());
         managerThread.join(5000);

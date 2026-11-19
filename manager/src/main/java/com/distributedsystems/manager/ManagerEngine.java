@@ -51,6 +51,8 @@ public class ManagerEngine {
     }
 
     public void start() {
+        syncActiveClientsTag();
+
         Thread clientListener = new Thread(this::pollClientRequests, "client-listener");
         Thread workerListener = new Thread(this::pollWorkerResults, "worker-listener");
 
@@ -64,6 +66,15 @@ public class ManagerEngine {
             Thread.currentThread().interrupt();
         } finally {
             shutdownSequence();
+        }
+    }
+
+    private void syncActiveClientsTag() {
+        int activeCount = activeJobs.size() + pendingJobSetups.get();
+        try {
+            compute.updateActiveClients(activeCount);
+        } catch (Exception e) {
+            System.err.println("Failed updating ActiveClients tag (" + activeCount + "): " + e.getMessage());
         }
     }
 
@@ -100,11 +111,19 @@ public class ManagerEngine {
 
                         sqs.deleteMessage(appToManagerUrl, msg);
                         pendingJobSetups.incrementAndGet();
+                        syncActiveClientsTag();
+
                         jobSetupPool.submit(() -> {
+                            boolean addedToActiveJobs = false;
                             try {
-                                handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
+                                addedToActiveJobs = handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
+                            } catch (Exception e) {
+                                System.err.println("Failed handling NEW_TASK for client " + clientId + ": " + e.getMessage());
                             } finally {
                                 pendingJobSetups.decrementAndGet();
+                                if (!addedToActiveJobs) {
+                                    syncActiveClientsTag();
+                                }
                             }
                         });
                     }
@@ -115,7 +134,7 @@ public class ManagerEngine {
         }
     }
 
-    void handleNewTask(String clientId, String responseQueueUrl, String s3InputKey, int n) {
+    boolean handleNewTask(String clientId, String responseQueueUrl, String s3InputKey, int n) {
         List<String> rawLines = storage.downloadLines(s3InputKey);
         List<String> validUrls = rawLines.stream()
                 .map(String::trim)
@@ -126,10 +145,11 @@ public class ManagerEngine {
 
         if (job.getTotalTasks() == 0) {
             completeClientJob(job);
-            return;
+            return false;
         }
 
         activeJobs.put(clientId, job);
+        syncActiveClientsTag();
 
         int launched = scaler.scaleForNewJob(job.getTotalTasks(), n);
         System.out.printf("[Client %s] Images: %d, n: %d -> Launched %d new workers%n",
@@ -146,6 +166,7 @@ public class ManagerEngine {
         if (!batch.isEmpty()) {
             sqs.sendMessagesBatch(managerToWorkersUrl, batch);
         }
+        return true;
     }
 
     private void pollWorkerResults() {
@@ -191,6 +212,7 @@ public class ManagerEngine {
         boolean isLastTask = job.recordResult(taskIndex, imageUrl, payload, isError);
         if (isLastTask) {
             activeJobs.remove(clientId);
+            syncActiveClientsTag();
             completeClientJob(job);
         }
     }
