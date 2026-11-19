@@ -31,10 +31,11 @@ public class SQSTest {
             sqs.sendMessage(appToManagerUrl,
                     MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt", expectedN));
 
-            // Manager -> Workers: Batch of IMAGE_TASK
+            // Manager -> Workers: Batch of IMAGE_TASK (including a duplicate URL at index 0 and 2)
             List<String> tasks = Arrays.asList(
-                    MessageProtocol.createImageTaskMsg(clientId, "http://example.com/valid.jpg"),
-                    MessageProtocol.createImageTaskMsg(clientId, "http://example.com/broken.jpg")
+                    MessageProtocol.createImageTaskMsg(clientId, 0, "http://example.com/valid.jpg"),
+                    MessageProtocol.createImageTaskMsg(clientId, 1, "http://example.com/broken.jpg"),
+                    MessageProtocol.createImageTaskMsg(clientId, 2, "http://example.com/valid.jpg")
             );
             sqs.sendMessagesBatch(managerToWorkersUrl, tasks);
 
@@ -59,14 +60,15 @@ public class SQSTest {
             List<Message> workerTasks = sqs.receiveMessages(managerToWorkersUrl, 10);
             for (Message task : workerTasks) {
                 String[] parts = MessageProtocol.parse(task.body());
-                String url = parts[2];
+                int taskIndex = MessageProtocol.parseTaskIndex(parts);
+                String url = parts[3];
 
                 if (url.contains("valid")) {
                     sqs.sendMessage(workersToManagerUrl,
-                            MessageProtocol.createOcrDoneMsg(clientId, url, "Extracted Text\nLine 2"));
+                            MessageProtocol.createOcrDoneMsg(clientId, taskIndex, url, "Extracted Text\nLine 2"));
                 } else {
                     sqs.sendMessage(workersToManagerUrl,
-                            MessageProtocol.createOcrErrorMsg(clientId, url, "HTTP 404 Not Found"));
+                            MessageProtocol.createOcrErrorMsg(clientId, taskIndex, url, "HTTP 404 Not Found"));
                 }
                 sqs.deleteMessage(managerToWorkersUrl, task);
             }
@@ -74,10 +76,14 @@ public class SQSTest {
             List<Message> workerResults = sqs.receiveMessages(workersToManagerUrl, 10);
             for (Message res : workerResults) {
                 String[] parts = MessageProtocol.parse(res.body());
+                int taskIndex = MessageProtocol.parseTaskIndex(parts);
+                String url = parts[3];
+
                 if (parts[0].equals(MessageProtocol.MessageType.OCR_DONE.name())) {
-                    System.out.println("Manager got OCR_DONE: " + MessageProtocol.decodeOcrText(parts[3]).replace("\n", " | "));
+                    System.out.println("Manager got OCR_DONE [index=" + taskIndex + ", url=" + url + "]: "
+                            + MessageProtocol.decodeOcrText(parts[4]).replace("\n", " | "));
                 } else {
-                    System.out.println("Manager got OCR_ERROR: " + parts[3]);
+                    System.out.println("Manager got OCR_ERROR [index=" + taskIndex + ", url=" + url + "]: " + parts[4]);
                 }
                 sqs.deleteMessage(workersToManagerUrl, res);
             }
@@ -88,15 +94,22 @@ public class SQSTest {
             System.out.println("Local App received: " + Arrays.toString(MessageProtocol.parse(jobDone.body())));
             sqs.deleteMessage(clientReplyUrl, jobDone);
 
-            // Verify validation rejects non-positive n
+            // Verify validation rejects invalid n or negative taskIndex
             try {
                 MessageProtocol.createNewTaskMsg(clientId, clientReplyUrl, "inputs/urls.txt", 0);
                 throw new AssertionError("Expected IllegalArgumentException for n <= 0");
             } catch (IllegalArgumentException expected) {
-                System.out.println("Validation check passed: rejected n <= 0");
+                System.out.println("Validation check 1 passed: rejected n <= 0");
             }
 
-            // 5. Cleanup temporary client reply queue (keep the 3 core queues ready, or delete all)
+            try {
+                MessageProtocol.createImageTaskMsg(clientId, -1, "http://example.com/valid.jpg");
+                throw new AssertionError("Expected IllegalArgumentException for taskIndex < 0");
+            } catch (IllegalArgumentException expected) {
+                System.out.println("Validation check 2 passed: rejected taskIndex < 0");
+            }
+
+            // 5. Cleanup temporary client reply queue (keep the 3 core queues ready)
             sqs.deleteQueue(clientReplyUrl);
             System.out.println("\nClient reply queue deleted. Core 3 queues remain ready in AWS SQS!");
         }

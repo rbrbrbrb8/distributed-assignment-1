@@ -23,9 +23,9 @@ Communication between the Local Application, Manager, and Workers is handled via
 | :--- | :--- | :--- |
 | Local App $\rightarrow$ Manager | `NEW_TASK` | `NEW_TASK###<clientId>###<responseQueueUrl>###<s3InputKey>###<n>` |
 | Local App $\rightarrow$ Manager | `TERMINATE` | `TERMINATE` |
-| Manager $\rightarrow$ Worker | `IMAGE_TASK` | `IMAGE_TASK###<clientId>###<imageUrl>` |
-| Worker $\rightarrow$ Manager | `OCR_DONE` | `OCR_DONE###<clientId>###<imageUrl>###<base64EncodedText>` |
-| Worker $\rightarrow$ Manager | `OCR_ERROR` | `OCR_ERROR###<clientId>###<imageUrl>###<errorDescription>` |
+| Manager $\rightarrow$ Worker | `IMAGE_TASK` | `IMAGE_TASK###<clientId>###<taskIndex>###<imageUrl>` |
+| Worker $\rightarrow$ Manager | `OCR_DONE` | `OCR_DONE###<clientId>###<taskIndex>###<imageUrl>###<base64EncodedText>` |
+| Worker $\rightarrow$ Manager | `OCR_ERROR` | `OCR_ERROR###<clientId>###<taskIndex>###<imageUrl>###<errorDescription>` |
 | Manager $\rightarrow$ Local App | `JOB_DONE` | `JOB_DONE###<s3OutputKey>` |
 
 - **Payload Safety:** Extracted OCR text in `OCR_DONE` is Base64-encoded (UTF-8) to prevent newlines or `###` sequences inside recognized text from breaking message parsing. Error messages in `OCR_ERROR` are sanitized before transmission.

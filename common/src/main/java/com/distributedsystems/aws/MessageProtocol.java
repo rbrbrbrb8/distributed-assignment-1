@@ -35,19 +35,37 @@ public class MessageProtocol {
     }
 
     // 3. Manager -> Worker
-    public static String createImageTaskMsg(String clientId, String imageUrl) {
-        return String.join(DELIMITER, MessageType.IMAGE_TASK.name(), clientId, imageUrl);
+    public static String createImageTaskMsg(String clientId, int taskIndex, String imageUrl) {
+        if (taskIndex < 0) {
+            throw new IllegalArgumentException("taskIndex must be non-negative");
+        }
+        return String.join(DELIMITER,
+                MessageType.IMAGE_TASK.name(),
+                clientId,
+                String.valueOf(taskIndex),
+                imageUrl);
     }
 
     // 4. Worker -> Manager (Success)
-    public static String createOcrDoneMsg(String clientId, String imageUrl, String extractedText) {
+    public static String createOcrDoneMsg(String clientId, int taskIndex, String imageUrl, String extractedText) {
+        if (taskIndex < 0) {
+            throw new IllegalArgumentException("taskIndex must be non-negative");
+        }
         String safeText = (extractedText == null) ? "" : extractedText;
         String encodedText = Base64.getEncoder().encodeToString(safeText.getBytes(StandardCharsets.UTF_8));
-        return String.join(DELIMITER, MessageType.OCR_DONE.name(), clientId, imageUrl, encodedText);
+        return String.join(DELIMITER,
+                MessageType.OCR_DONE.name(),
+                clientId,
+                String.valueOf(taskIndex),
+                imageUrl,
+                encodedText);
     }
 
     // 5. Worker -> Manager (Exception recovery)
-    public static String createOcrErrorMsg(String clientId, String imageUrl, String errorDescription) {
+    public static String createOcrErrorMsg(String clientId, int taskIndex, String imageUrl, String errorDescription) {
+        if (taskIndex < 0) {
+            throw new IllegalArgumentException("taskIndex must be non-negative");
+        }
         String safeError = (errorDescription == null || errorDescription.isBlank())
                 ? "Unknown processing exception"
                 : errorDescription;
@@ -55,7 +73,12 @@ public class MessageProtocol {
                 .replace("\n", " ")
                 .replace("\r", " ")
                 .replace(DELIMITER, " ");
-        return String.join(DELIMITER, MessageType.OCR_ERROR.name(), clientId, imageUrl, cleanError);
+        return String.join(DELIMITER,
+                MessageType.OCR_ERROR.name(),
+                clientId,
+                String.valueOf(taskIndex),
+                imageUrl,
+                cleanError);
     }
 
     // 6. Manager -> Local App
@@ -82,6 +105,21 @@ public class MessageProtocol {
             return n;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("Invalid integer for n in NEW_TASK: " + parts[4], e);
+        }
+    }
+
+    public static int parseTaskIndex(String[] parts) {
+        if (parts == null || parts.length < 4) {
+            throw new IllegalArgumentException("Invalid task/result message format: missing taskIndex");
+        }
+        try {
+            int taskIndex = Integer.parseInt(parts[2]);
+            if (taskIndex < 0) {
+                throw new IllegalArgumentException("taskIndex must be non-negative, got: " + taskIndex);
+            }
+            return taskIndex;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid integer for taskIndex: " + parts[2], e);
         }
     }
 
