@@ -5,6 +5,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class ClientJob {
+    public static final String ENTRY_DELIMITER = "\n===OCR_ENTRY===\n";
+
     private final String clientId;
     private final String responseQueueUrl;
     private final int n;
@@ -30,9 +32,10 @@ public class ClientJob {
             return false;
         }
 
+        String safeText = (textOrError == null) ? "" : textOrError;
         String line = isError
-                ? imageUrl + " | ERROR: " + textOrError
-                : imageUrl + " | OCR: " + textOrError;
+                ? imageUrl + " | ERROR: " + safeText
+                : imageUrl + " | OCR: " + safeText;
 
         synchronized (formattedResults) {
             if (formattedResults[taskIndex] != null) {
@@ -47,7 +50,7 @@ public class ClientJob {
     }
 
     public String buildSummaryContent() {
-        return String.join("\n", formattedResults);
+        return String.join(ENTRY_DELIMITER, formattedResults);
     }
 
     public int getRemainingTasks() {

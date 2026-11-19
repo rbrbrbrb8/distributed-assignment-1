@@ -1,6 +1,7 @@
 package com.distributedsystems.manager;
 
 import com.distributedsystems.aws.MessageProtocol;
+import com.distributedsystems.aws.S3Service;
 import com.distributedsystems.aws.SQSService;
 import com.distributedsystems.manager.CloudInterfaces.ComputeClient;
 import com.distributedsystems.manager.CloudInterfaces.StorageClient;
@@ -22,12 +23,11 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ManagerLocalTest {
-
-    // --- In-Memory Test Doubles (No AWS connection required) ---
 
     static class InMemoryStorage implements StorageClient {
         private final Map<String, String> files = new ConcurrentHashMap<>();
@@ -125,26 +125,20 @@ class ManagerLocalTest {
 
         @Override
         public void deleteMessage(String queueUrl, Message message) {
-            // Already removed upon poll/drainTo in local queue
         }
     }
-
-    // --- Unit & Integration Tests ---
 
     @Test
     void testWorkerScalingFormulaAndCap() {
         InMemoryCompute compute = new InMemoryCompute();
         WorkerScaler scaler = new WorkerScaler(compute, 8);
 
-        // ceil(12 / 5) = 3 workers
         assertEquals(3, scaler.scaleForNewJob(12, 5));
         assertEquals(3, compute.getActiveWorkerCount());
 
-        // Job needing 2 workers when 3 are already active -> launches 0
         assertEquals(0, scaler.scaleForNewJob(10, 5));
         assertEquals(3, compute.getActiveWorkerCount());
 
-        // Job needing ceil(50 / 2) = 25 workers -> capped at maxWorkers (8) -> launches 5 more
         assertEquals(5, scaler.scaleForNewJob(50, 2));
         assertEquals(8, compute.getActiveWorkerCount());
     }
@@ -183,27 +177,22 @@ class ManagerLocalTest {
 
     @Test
     void testClientJobOrderingDuplicatesAndErrors() {
-        // Includes duplicate URL at index 0 and index 2
         List<String> urls = List.of("http://img/a.png", "http://img/b.png", "http://img/a.png");
         ClientJob job = new ClientJob("client-1", "resp-q", 2, urls);
 
-        // Out-of-order completion: index 2 arrives first
         assertFalse(job.recordResult(2, "http://img/a.png", "text-2", false));
-        // Duplicate SQS delivery for index 2 -> must be ignored
         assertFalse(job.recordResult(2, "http://img/a.png", "text-2", false));
         assertEquals(2, job.getRemainingTasks());
 
-        // Index 0 fails with OCR error
         assertFalse(job.recordResult(0, "http://img/a.png", "404 Not Found", true));
         assertEquals(1, job.getRemainingTasks());
 
-        // Final task (index 1) completes the job
-        assertTrue(job.recordResult(1, "http://img/b.png", "text-1", false));
+        assertTrue(job.recordResult(1, "http://img/b.png", "text-1\nsecond line", false));
         assertEquals(0, job.getRemainingTasks());
 
-        String expectedSummary = String.join("\n",
+        String expectedSummary = String.join(ClientJob.ENTRY_DELIMITER,
                 "http://img/a.png | ERROR: 404 Not Found",
-                "http://img/b.png | OCR: text-1",
+                "http://img/b.png | OCR: text-1\nsecond line",
                 "http://img/a.png | OCR: text-2"
         );
         assertEquals(expectedSummary, job.buildSummaryContent());
@@ -220,19 +209,23 @@ class ManagerLocalTest {
         String managerToWorkers = "manager-to-workers";
         String workersToManager = "workers-to-manager";
 
-        // Prepare input files for two concurrent clients
+        String inputKeyA = S3Service.inputKey("client-a");
+        String inputKeyB = S3Service.inputKey("client-b");
+        String expectedSummaryKeyA = S3Service.summaryKey("client-a");
+        String expectedSummaryKeyB = S3Service.summaryKey("client-b");
+
         List<String> clientAUrls = new ArrayList<>();
         for (int i = 0; i < 12; i++) {
             clientAUrls.add("http://example.com/a-" + i + ".png");
         }
-        storage.putLines("inputs/client-a.txt", clientAUrls);
+        storage.putLines(inputKeyA, clientAUrls);
 
         List<String> clientBUrls = List.of(
                 "http://example.com/dup.png",
                 "http://example.com/unique.png",
                 "http://example.com/dup.png"
         );
-        storage.putLines("inputs/client-b.txt", clientBUrls);
+        storage.putLines(inputKeyB, clientBUrls);
 
         ManagerEngine engine = new ManagerEngine(
                 sqs, storage, compute, 4,
@@ -242,11 +235,9 @@ class ManagerLocalTest {
         Thread managerThread = new Thread(engine::start, "manager-main");
         managerThread.start();
 
-        // Submit Client A (12 images, n=4 -> needs 3 workers) and Client B (3 images, n=2 -> needs 2 workers)
-        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-a", "resp-a", "inputs/client-a.txt", 4));
-        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-b", "resp-b", "inputs/client-b.txt", 2));
+        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-a", "resp-a", inputKeyA, 4));
+        sqs.sendMessage(appToManager, MessageProtocol.createNewTaskMsg("client-b", "resp-b", inputKeyB, 2));
 
-        // Simulate Workers consuming all 15 IMAGE_TASK messages and posting OCR results
         int processedTasks = 0;
         while (processedTasks < 15) {
             List<Message> tasks = sqs.receiveMessages(managerToWorkers, 10);
@@ -266,7 +257,6 @@ class ManagerLocalTest {
                             clientId, taskIndex, url, "Text-" + clientId + "-" + taskIndex);
                     sqs.sendMessage(workersToManager, doneMsg);
 
-                    // Inject a duplicate SQS message for taskIndex 0 to verify idempotency
                     if (taskIndex == 0) {
                         sqs.sendMessage(workersToManager, doneMsg);
                     }
@@ -275,32 +265,28 @@ class ManagerLocalTest {
             }
         }
 
-        // Wait for JOB_DONE notifications on both client response queues
         Message respA = waitForSingleMessage(sqs, "resp-a");
         Message respB = waitForSingleMessage(sqs, "resp-b");
 
-        assertEquals(MessageProtocol.createJobDoneMsg("outputs/summary-client-a.txt"), respA.body());
-        assertEquals(MessageProtocol.createJobDoneMsg("outputs/summary-client-b.txt"), respB.body());
+        assertEquals(MessageProtocol.createJobDoneMsg(expectedSummaryKeyA), respA.body());
+        assertEquals(MessageProtocol.createJobDoneMsg(expectedSummaryKeyB), respB.body());
 
-        // Verify uploaded S3 summary contents
-        String summaryA = storage.getRawContent("outputs/summary-client-a.txt");
+        String summaryA = storage.getRawContent(expectedSummaryKeyA);
         assertNotNull(summaryA);
-        String[] linesA = summaryA.split("\n");
-        assertEquals(12, linesA.length);
-        assertEquals("http://example.com/a-5.png | ERROR: Corrupted image header", linesA[5]);
-        assertEquals("http://example.com/a-11.png | OCR: Text-client-a-11", linesA[11]);
+        String[] entriesA = summaryA.split(Pattern.quote(ClientJob.ENTRY_DELIMITER));
+        assertEquals(12, entriesA.length);
+        assertEquals("http://example.com/a-5.png | ERROR: Corrupted image header", entriesA[5]);
+        assertEquals("http://example.com/a-11.png | OCR: Text-client-a-11", entriesA[11]);
 
-        String summaryB = storage.getRawContent("outputs/summary-client-b.txt");
-        assertEquals(String.join("\n",
+        String summaryB = storage.getRawContent(expectedSummaryKeyB);
+        assertEquals(String.join(ClientJob.ENTRY_DELIMITER,
                 "http://example.com/dup.png | OCR: Text-client-b-0",
                 "http://example.com/unique.png | OCR: Text-client-b-1",
                 "http://example.com/dup.png | OCR: Text-client-b-2"
         ), summaryB);
 
-        // Verify scaling never exceeded maxWorkers (4)
         assertTrue(compute.totalLaunched.get() >= 3 && compute.totalLaunched.get() <= 4);
 
-        // Send TERMINATE and verify clean shutdown of workers and manager
         sqs.sendMessage(appToManager, MessageProtocol.createTerminateMsg());
         managerThread.join(5000);
         assertFalse(managerThread.isAlive());
