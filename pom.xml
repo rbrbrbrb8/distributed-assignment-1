@@ -13,6 +13,7 @@
   <modules>
     <module>common</module>
     <module>worker</module>
+    <module>manager</module>
   </modules>
 
   <properties>
