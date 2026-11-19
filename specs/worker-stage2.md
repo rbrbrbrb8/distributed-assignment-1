@@ -108,7 +108,10 @@ Goal of stage 2: the worker runs on EC2 as a long-lived SQS consumer. Its instan
    - `terminate(ids)`.
    - `UserData.worker(bucket, jarKey)` builds the boot script: download the jar from S3, run it, and log to
      `/var/log/worker.log`.
-5. **Bootstrapping:** a custom Ubuntu AMI with Java 21 and Tesseract preinstalled. The tess4j jar has no Linux
+5. **Bootstrapping:** a custom Ubuntu AMI with Java 21 and Tesseract preinstalled.
+   - **One AMI (`ocr-base-ami`) for both manager and workers.** The role is decided by the user-data, i.e. which
+     jar it downloads and runs. The manager reads its own AMI id from the instance metadata service and uses it
+     to launch workers, so the id is never hardcoded. The tess4j jar has no Linux
    native library, so Tesseract comes from the OS. The jar is pulled from S3 at boot, so code changes need no new
    AMI. Fallback if creating AMIs is blocked: install everything in user-data.
 

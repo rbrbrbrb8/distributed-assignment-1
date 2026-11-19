@@ -26,3 +26,4 @@ Assignment1.pdf
 *.ppk
 credentials
 .env
+claude-session.txt
