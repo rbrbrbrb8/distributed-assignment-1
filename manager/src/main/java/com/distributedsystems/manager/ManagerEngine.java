@@ -1,6 +1,7 @@
 package com.distributedsystems.manager;
 
 import com.distributedsystems.aws.MessageProtocol;
+import com.distributedsystems.aws.S3Service;
 import com.distributedsystems.aws.SQSService;
 import com.distributedsystems.manager.CloudInterfaces.ComputeClient;
 import com.distributedsystems.manager.CloudInterfaces.StorageClient;
@@ -17,6 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class ManagerEngine {
     private static final int SQS_BATCH_LIMIT = 10;
+    private static final long POLL_ERROR_BACKOFF_MS = 1000;
 
     private final SQSService sqs;
     private final StorageClient storage;
@@ -49,6 +51,8 @@ public class ManagerEngine {
     }
 
     public void start() {
+        syncActiveClientsTag();
+
         Thread clientListener = new Thread(this::pollClientRequests, "client-listener");
         Thread workerListener = new Thread(this::pollWorkerResults, "worker-listener");
 
@@ -65,9 +69,29 @@ public class ManagerEngine {
         }
     }
 
+    private void syncActiveClientsTag() {
+        int activeCount = activeJobs.size() + pendingJobSetups.get();
+        try {
+            compute.updateActiveClients(activeCount);
+        } catch (Exception e) {
+            System.err.println("Failed updating ActiveClients tag (" + activeCount + "): " + e.getMessage());
+        }
+    }
+
     private void pollClientRequests() {
-        while (!terminating.get()) {
-            List<Message> messages = sqs.receiveMessages(appToManagerUrl, 5);
+        while (!terminating.get() && !Thread.currentThread().isInterrupted()) {
+            List<Message> messages;
+            try {
+                messages = sqs.receiveMessages(appToManagerUrl, 5);
+            } catch (Exception e) {
+                if (terminating.get() || Thread.currentThread().isInterrupted()) {
+                    break;
+                }
+                System.err.println("Transient error polling client requests: " + e.getMessage());
+                sleepQuietly(POLL_ERROR_BACKOFF_MS);
+                continue;
+            }
+
             for (Message msg : messages) {
                 try {
                     String[] parts = MessageProtocol.parse(msg.body());
@@ -87,11 +111,19 @@ public class ManagerEngine {
 
                         sqs.deleteMessage(appToManagerUrl, msg);
                         pendingJobSetups.incrementAndGet();
+                        syncActiveClientsTag();
+
                         jobSetupPool.submit(() -> {
+                            boolean addedToActiveJobs = false;
                             try {
-                                handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
+                                addedToActiveJobs = handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
+                            } catch (Exception e) {
+                                System.err.println("Failed handling NEW_TASK for client " + clientId + ": " + e.getMessage());
                             } finally {
                                 pendingJobSetups.decrementAndGet();
+                                if (!addedToActiveJobs) {
+                                    syncActiveClientsTag();
+                                }
                             }
                         });
                     }
@@ -102,8 +134,7 @@ public class ManagerEngine {
         }
     }
 
-    // Package-private to allow direct local testing without SQS dependency
-    void handleNewTask(String clientId, String responseQueueUrl, String s3InputKey, int n) {
+    boolean handleNewTask(String clientId, String responseQueueUrl, String s3InputKey, int n) {
         List<String> rawLines = storage.downloadLines(s3InputKey);
         List<String> validUrls = rawLines.stream()
                 .map(String::trim)
@@ -112,20 +143,18 @@ public class ManagerEngine {
 
         ClientJob job = new ClientJob(clientId, responseQueueUrl, n, validUrls);
 
-        // Edge case: empty input file with no image URLs
         if (job.getTotalTasks() == 0) {
             completeClientJob(job);
-            return;
+            return false;
         }
 
         activeJobs.put(clientId, job);
+        syncActiveClientsTag();
 
-        // 1. Launch required Workers before/alongside dispatching tasks
         int launched = scaler.scaleForNewJob(job.getTotalTasks(), n);
         System.out.printf("[Client %s] Images: %d, n: %d -> Launched %d new workers%n",
                 clientId, job.getTotalTasks(), n, launched);
 
-        // 2. Split into IMAGE_TASK messages and send in batches of 10
         List<String> batch = new ArrayList<>(SQS_BATCH_LIMIT);
         for (int i = 0; i < validUrls.size(); i++) {
             batch.add(MessageProtocol.createImageTaskMsg(clientId, i, validUrls.get(i)));
@@ -137,11 +166,24 @@ public class ManagerEngine {
         if (!batch.isEmpty()) {
             sqs.sendMessagesBatch(managerToWorkersUrl, batch);
         }
+        return true;
     }
 
     private void pollWorkerResults() {
-        while (!terminating.get() || pendingJobSetups.get() > 0 || !activeJobs.isEmpty()) {
-            List<Message> messages = sqs.receiveMessages(workersToManagerUrl, 10);
+        while ((!terminating.get() || pendingJobSetups.get() > 0 || !activeJobs.isEmpty())
+                && !Thread.currentThread().isInterrupted()) {
+            List<Message> messages;
+            try {
+                messages = sqs.receiveMessages(workersToManagerUrl, 10);
+            } catch (Exception e) {
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
+                System.err.println("Transient error polling worker results: " + e.getMessage());
+                sleepQuietly(POLL_ERROR_BACKOFF_MS);
+                continue;
+            }
+
             for (Message msg : messages) {
                 try {
                     String[] parts = MessageProtocol.parse(msg.body());
@@ -162,7 +204,6 @@ public class ManagerEngine {
         }
     }
 
-    // Package-private for local testing
     void handleWorkerResult(String clientId, int taskIndex, String imageUrl, String payload, boolean isError) {
         ClientJob job = activeJobs.get(clientId);
         if (job == null) {
@@ -171,12 +212,13 @@ public class ManagerEngine {
         boolean isLastTask = job.recordResult(taskIndex, imageUrl, payload, isError);
         if (isLastTask) {
             activeJobs.remove(clientId);
+            syncActiveClientsTag();
             completeClientJob(job);
         }
     }
 
     private void completeClientJob(ClientJob job) {
-        String s3OutputKey = "outputs/summary-" + job.getClientId() + ".txt";
+        String s3OutputKey = S3Service.summaryKey(job.getClientId());
         storage.uploadText(s3OutputKey, job.buildSummaryContent());
         sqs.sendMessage(job.getResponseQueueUrl(), MessageProtocol.createJobDoneMsg(s3OutputKey));
         System.out.printf("[Client %s] Completed all %d tasks. Uploaded %s%n",
@@ -192,5 +234,13 @@ public class ManagerEngine {
         }
         compute.terminateAllWorkers();
         compute.terminateSelf();
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

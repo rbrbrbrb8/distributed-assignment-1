@@ -21,13 +21,26 @@ public final class UserData {
 
     /** Boot script for a worker: run {@code worker.jar} in SQS mode, logging to {@code /var/log/worker.log}. */
     public static String worker(String bucket, String jarKey) {
-        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log");
+        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log", "");
+    }
+
+    /** Boot script for the manager: run {@code manager.jar <bucket>}, logging to {@code /var/log/manager.log}. */
+    public static String manager(String bucket, String jarKey) {
+        return forJar(bucket, jarKey, "manager.jar", "/var/log/manager.log", bucket);
     }
 
     static String forJar(String bucket, String jarKey, String jarName, String logFile) {
+        return forJar(bucket, jarKey, jarName, logFile, "");
+    }
+
+    private static String forJar(String bucket, String jarKey, String jarName, String logFile, String jarArg) {
         requireSafe("bucket", bucket);
         requireSafe("jarKey", jarKey);
+        if (jarArg != null && !jarArg.isEmpty()) {
+            requireSafe("jarArg", jarArg);
+        }
         String jarPath = INSTALL_DIR + "/" + jarName;
+        String argSuffix = (jarArg == null || jarArg.isEmpty()) ? "" : " " + jarArg;
         return String.join("\n",
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -36,7 +49,7 @@ public final class UserData {
                 "mkdir -p " + INSTALL_DIR,
                 AWS_CLI + " s3 cp s3://" + bucket + "/" + jarKey + " " + jarPath + " --only-show-errors",
                 "cd " + INSTALL_DIR,
-                "nohup java -jar " + jarPath + " >> " + logFile + " 2>&1 &",
+                "nohup java -jar " + jarPath + argSuffix + " >> " + logFile + " 2>&1 &",
                 "echo \"started " + jarName + " (pid $!)\"",
                 "");
     }
