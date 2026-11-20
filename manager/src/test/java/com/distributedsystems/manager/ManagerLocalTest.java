@@ -62,6 +62,7 @@ class ManagerLocalTest {
         private final AtomicInteger totalLaunched = new AtomicInteger(0);
         private final AtomicBoolean workersTerminated = new AtomicBoolean(false);
         private final AtomicBoolean selfTerminated = new AtomicBoolean(false);
+        private final AtomicBoolean markedTerminating = new AtomicBoolean(false);
         private final List<Integer> activeClientsHistory = Collections.synchronizedList(new ArrayList<>());
 
         @Override
@@ -84,6 +85,11 @@ class ManagerLocalTest {
         @Override
         public void terminateSelf() {
             selfTerminated.set(true);
+        }
+
+        @Override
+        public void markTerminating() {
+            markedTerminating.set(true);
         }
 
         @Override
@@ -306,12 +312,37 @@ class ManagerLocalTest {
         assertTrue(compute.activeClientsHistory.contains(0));
         assertEquals(0, compute.activeClientsHistory.get(compute.activeClientsHistory.size() - 1));
 
+        assertFalse(compute.markedTerminating.get()); // not marked before TERMINATE arrives
+
         sqs.sendMessage(appToManager, MessageProtocol.createTerminateMsg());
         managerThread.join(5000);
         assertFalse(managerThread.isAlive());
+        assertTrue(compute.markedTerminating.get()); // M2: local apps no longer see it as Role=MANAGER
         assertTrue(compute.workersTerminated.get());
         assertTrue(compute.selfTerminated.get());
         assertEquals(0, compute.getActiveWorkerCount());
+    }
+
+    @Test
+    void resultsForUnknownClientsAreNotOursButLateDuplicatesAre() {
+        // M5: handleWorkerResult's answer decides whether the result message is deleted.
+        InMemorySQSService sqs = new InMemorySQSService();
+        InMemoryStorage storage = new InMemoryStorage();
+        String inputKey = S3Service.inputKey("client-1");
+        storage.putLines(inputKey, List.of("http://img/a.png"));
+
+        ManagerEngine engine = new ManagerEngine(sqs, storage, new InMemoryCompute(), 4,
+                "app-to-manager", "manager-to-workers", "workers-to-manager");
+
+        // never had a job for this client (e.g. another manager's): not ours, leave it in the queue
+        assertFalse(engine.handleWorkerResult("someone-else", 0, "http://img/x.png", "text", false));
+
+        assertTrue(engine.handleNewTask("client-1", "resp-1", inputKey, 1));
+        assertTrue(engine.handleWorkerResult("client-1", 0, "http://img/a.png", "text", false)); // completes the job
+        assertEquals(1, sqs.receiveMessages("resp-1", 10).size()); // JOB_DONE sent
+
+        // a late duplicate for the finished job is still ours: delete it as before
+        assertTrue(engine.handleWorkerResult("client-1", 0, "http://img/a.png", "text", false));
     }
 
     private Message waitForSingleMessage(InMemorySQSService sqs, String queueUrl) {

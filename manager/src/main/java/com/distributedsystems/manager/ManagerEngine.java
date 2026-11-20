@@ -9,6 +9,7 @@ import software.amazon.awssdk.services.sqs.model.Message;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,6 +31,8 @@ public class ManagerEngine {
     private final String workersToManagerUrl;
 
     private final ConcurrentHashMap<String, ClientJob> activeJobs = new ConcurrentHashMap<>();
+    /** Jobs this manager completed; their late duplicate results are deleted instead of left for others. */
+    private final Set<String> finishedClients = ConcurrentHashMap.newKeySet();
     private final ExecutorService jobSetupPool = Executors.newCachedThreadPool();
     private final AtomicInteger pendingJobSetups = new AtomicInteger(0);
     private final AtomicBoolean terminating = new AtomicBoolean(false);
@@ -78,6 +81,15 @@ public class ManagerEngine {
         }
     }
 
+    /** Tells local apps not to pick this manager any more. A failure is only logged: shutdown must go on. */
+    private void markTerminating() {
+        try {
+            compute.markTerminating();
+        } catch (Exception e) {
+            System.err.println("Failed marking this manager as terminating: " + e.getMessage());
+        }
+    }
+
     private void pollClientRequests() {
         while (!terminating.get() && !Thread.currentThread().isInterrupted()) {
             List<Message> messages;
@@ -99,6 +111,7 @@ public class ManagerEngine {
 
                     if (MessageProtocol.MessageType.TERMINATE.name().equals(type)) {
                         terminating.set(true);
+                        markTerminating();
                         sqs.deleteMessage(appToManagerUrl, msg);
                         break;
                     }
@@ -195,8 +208,11 @@ public class ManagerEngine {
                     boolean isError = MessageProtocol.MessageType.OCR_ERROR.name().equals(type);
                     String payload = isError ? parts[4] : MessageProtocol.decodeOcrText(parts[4]);
 
-                    handleWorkerResult(clientId, taskIndex, imageUrl, payload, isError);
-                    sqs.deleteMessage(workersToManagerUrl, msg);
+                    // A result for a client we don't know may belong to another manager: leave it in the queue
+                    // (it reappears after the visibility timeout) instead of deleting it.
+                    if (handleWorkerResult(clientId, taskIndex, imageUrl, payload, isError)) {
+                        sqs.deleteMessage(workersToManagerUrl, msg);
+                    }
                 } catch (Exception e) {
                     System.err.println("Failed processing worker result: " + e.getMessage());
                 }
@@ -204,17 +220,23 @@ public class ManagerEngine {
         }
     }
 
-    void handleWorkerResult(String clientId, int taskIndex, String imageUrl, String payload, boolean isError) {
+    /**
+     * @return true if the result is ours (an active job, or a late duplicate for a job we already finished), so it
+     *         can be deleted; false if this manager never had a job for {@code clientId}
+     */
+    boolean handleWorkerResult(String clientId, int taskIndex, String imageUrl, String payload, boolean isError) {
         ClientJob job = activeJobs.get(clientId);
         if (job == null) {
-            return;
+            return finishedClients.contains(clientId);
         }
         boolean isLastTask = job.recordResult(taskIndex, imageUrl, payload, isError);
         if (isLastTask) {
+            finishedClients.add(clientId);
             activeJobs.remove(clientId);
             syncActiveClientsTag();
             completeClientJob(job);
         }
+        return true;
     }
 
     private void completeClientJob(ClientJob job) {
