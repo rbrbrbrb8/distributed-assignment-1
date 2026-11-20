@@ -16,5 +16,8 @@ public class CloudInterfaces {
         void terminateSelf();
         default void updateActiveClients(int activeClientCount) {
         }
+        /** Marks this manager as shutting down, so local apps no longer pick it for new jobs. */
+        default void markTerminating() {
+        }
     }
 }

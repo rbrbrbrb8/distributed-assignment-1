@@ -21,26 +21,30 @@ public final class UserData {
 
     /** Boot script for a worker: run {@code worker.jar} in SQS mode, logging to {@code /var/log/worker.log}. */
     public static String worker(String bucket, String jarKey) {
-        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log", "");
+        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log");
     }
 
-    /** Boot script for the manager: run {@code manager.jar <bucket>}, logging to {@code /var/log/manager.log}. */
-    public static String manager(String bucket, String jarKey) {
-        return forJar(bucket, jarKey, "manager.jar", "/var/log/manager.log", bucket);
+    /**
+     * Boot script for the manager: run {@code manager.jar <bucket> <workerAmiId>}, logging to
+     * {@code /var/log/manager.log}.
+     *
+     * @param workerAmiId AMI the manager starts its workers from (we use one shared AMI for manager and workers)
+     */
+    public static String manager(String bucket, String jarKey, String workerAmiId) {
+        requireSafe("workerAmiId", workerAmiId);
+        return forJar(bucket, jarKey, "manager.jar", "/var/log/manager.log", bucket, workerAmiId);
     }
 
-    static String forJar(String bucket, String jarKey, String jarName, String logFile) {
-        return forJar(bucket, jarKey, jarName, logFile, "");
-    }
-
-    private static String forJar(String bucket, String jarKey, String jarName, String logFile, String jarArg) {
+    static String forJar(String bucket, String jarKey, String jarName, String logFile, String... jarArgs) {
         requireSafe("bucket", bucket);
         requireSafe("jarKey", jarKey);
-        if (jarArg != null && !jarArg.isEmpty()) {
-            requireSafe("jarArg", jarArg);
+        StringBuilder args = new StringBuilder();
+        for (String arg : jarArgs) {
+            requireSafe("jar argument", arg);
+            args.append(' ').append(arg);
         }
         String jarPath = INSTALL_DIR + "/" + jarName;
-        String argSuffix = (jarArg == null || jarArg.isEmpty()) ? "" : " " + jarArg;
+        String argSuffix = args.toString();
         return String.join("\n",
                 "#!/bin/bash",
                 "set -euo pipefail",
