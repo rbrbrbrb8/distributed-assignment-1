@@ -21,7 +21,7 @@ Already available and reused:
     `deleteQueue`, and the `APP_TO_MANAGER_QUEUE` constant;
   - `MessageProtocol`: `createNewTaskMsg(clientId, responseQueueUrl, s3InputKey, n)`, `createTerminateMsg()`,
     `parse`, the `JOB_DONE` type;
-  - `EC2Service`: `findActive(MANAGER)`, `launch(...)`, the 19-instance cap;
+  - `EC2Service`: `findActive(MANAGER)`, `launch(...)`, the global instance cap (9 since PR 2, was 19);
   - `UserData`: the `forJar(...)` pattern.
 - The manager in `main` already accepts `NEW_TASK` and `TERMINATE` and replies `JOB_DONE###<summaryKey>` on the
   given response queue.
@@ -66,7 +66,7 @@ credentials in it. AWS credentials come from `~/.aws/credentials` through the SD
 |---|---|---|---|
 | `ManagerLocator` interface: `ensureAvailableManager(int managerClientsN)`, `isAlive(ManagerHandle)` | `Ec2ManagerLocator`: available = any `Role=MANAGER` instance that is pending or running; otherwise `EC2Service.launch(MANAGER, 1, amiId, UserData.manager(bucket, "jars/manager.jar"))`. `isAlive` = the instance is still pending or running. | 3 (client count), 5 (terminating marker), 4 (manager jar) | Add a `ActiveClients < managerClientsN` and `State != TERMINATING` check in both methods. The manager jar only has to exist in S3. |
 | `UserData.manager(bucket, jarKey)` in `common` | Same pattern as `worker(...)`: download `jars/manager.jar`, `nohup java -jar`, log to `/var/log/manager.log` | 4 | Add arguments if the manager's `main` needs any |
-| `SummaryParser` interface: `List<OcrResult> parse(String)` | `PipeSummaryParser` for today's `url \| OCR: text` / `url \| ERROR: e`. Best effort: a line starting with `http` and containing ` \| OCR: ` or ` \| ERROR: ` starts a new entry, and other lines are continuation text. Index = order. | 1 (format) | A new parser class for the agreed format; switch one line in the wiring |
+| `SummaryParser` interface: `List<OcrResult> parse(String)` | Was `PipeSummaryParser` (best effort, plain text). **Since PR 2: `Base64SummaryParser`** for the manager's final format, one line per image: `url \| OCR: <Base64>` / `url \| ERROR: <Base64>`. `PipeSummaryParser` was deleted. | 1 (format), now resolved | A new parser class if the format changes again; switch one line in the wiring |
 | Summary key from `JOB_DONE` | Used as given; cleanup also deletes it if it lies outside `jobs/<clientId>/` | 2 | Nothing needed once the manager uses `summaryKey(clientId)` |
 
 ### Result model and HTML (local-app logic, independent of the gaps)
@@ -94,7 +94,7 @@ credentials in it. AWS credentials come from `~/.aws/credentials` through the SD
 |---|---|
 | `pom.xml` (root) | Add `<module>local-app</module>` |
 | `local-app/pom.xml` | **New**: depends on `common`, JUnit; shade plugin with `mainClass` `LocalAppMain`, `createDependencyReducedPom=false` |
-| `local-app/src/main/java/com/distributedsystems/localapp/` | **New**: `LocalAppMain`, `LocalAppArgs`, `LocalAppConfig`, `LocalApp`, `ManagerLocator`, `ManagerHandle`, `Ec2ManagerLocator`, `SummaryParser`, `PipeSummaryParser`, `HtmlReport` |
+| `local-app/src/main/java/com/distributedsystems/localapp/` | **New**: `LocalAppMain`, `LocalAppArgs`, `LocalAppConfig`, `LocalApp`, `ManagerLocator`, `ManagerHandle`, `Ec2ManagerLocator`, `SummaryParser`, `Base64SummaryParser` (replaced `PipeSummaryParser`), `HtmlReport` |
 | `common/src/main/java/com/distributedsystems/ocr/result/` (moved from `worker`) | `OcrResult`, `OcrSuccess`, `OcrFailure` (+ `OcrResultMessageTest`); worker imports updated |
 | `common/.../aws/UserData.java` (+ test) | Add `manager(bucket, jarKey)` |
 | `local-app/src/test/java/...` | Unit tests (below), plus a dev-only `StubManager` `main` |
@@ -111,22 +111,49 @@ credentials in it. AWS credentials come from `~/.aws/credentials` through the SD
 3b. `HtmlReport` (a `switch` over the sealed types), with tests: escaping, success and error lines, order, empty
     list, multi-line text.
 4. `SummaryParser` and `PipeSummaryParser`, with tests (multi-line OCR text, errors, empty summary).
-5. `ManagerLocator`, `ManagerHandle`, `Ec2ManagerLocator`, plus `UserData.manager`, with tests (`UserData`; the
-   locator's decision logic with a stub `EC2Service`).
-6. `LocalApp` orchestration and `LocalAppMain`, with flow tests using stub `SQSService`, `S3Service` and
-   `ManagerLocator` (subclass or implement and record calls, like `WorkerLoopTest`). Covers:
+   **Steps 2–4 merged as PR 1 (#9, "initial local app").**
+
+### PR 2 (branch `local-app-run`), revised 2026-11-20 after the friend's manager PR #8
+The friend's PR resolved open issues 1 and 2 and partly 3 and 4 (see `specs/open-issues.md`). It also added
+`UserData.manager(bucket, jarKey)`, so the stashed duplicate was dropped. Only `EC2Service.isActive` was kept from
+the stash.
+
+5. **Specs:** update `specs/open-issues.md` (statuses, plus new issue 8: the manager AMI bug) and this step list.
+   **Done 2026-11-20.**
+6. **(Done 2026-11-20; `PipeSummaryParser` deleted. Includes contract tests against the manager's real
+   `ClientJob`, via a test-scope dependency on `manager` that is not packaged into the jar.)**
+   `Base64SummaryParser implements SummaryParser` for the manager's format: one line per image,
+   `url | OCR: <Base64>` / `url | ERROR: <Base64>`. It becomes the default parser. Tests cover:
+   - round trip with multi-line text and Unicode;
+   - errors;
+   - an empty summary;
+   - a malformed line (clear error).
+7. **(Done 2026-11-20; package `localapp.manager`. The least-loaded available manager is chosen; a manager with
+   an unreadable tag is skipped; `EC2Service.ACTIVE_CLIENTS_TAG` has a contract test against the manager's
+   constant.)**
+   `ManagerLocator`, `ManagerHandle`, `Ec2ManagerLocator`, plus a small tag reader in `EC2Service`, e.g.
+   `getTag(instanceId, key)`.
+   - **Available** = pending/running `Role=MANAGER`, **and** its `ActiveClients` tag `< manager-clients-n` (open
+     issue 3). A missing tag counts as 0 (a manager that just booted).
+   - Otherwise launch with `UserData.manager(bucket, jarKey)` from `main`. If `launch` returns no instance (the
+     global cap of 9 is reached), fail with a clear error. Falling back to the least-loaded manager is a future
+     TODO (issue 10), not part of this step.
+   - `isTerminating` stays a TODO (open issue 5).
+   - Tests use a stub `EC2Service`.
+8. `LocalApp` orchestration and `LocalAppMain`, with flow tests using stub `SQSService`, `S3Service` and
+   `ManagerLocator`. Covers:
    - the happy path;
-   - a dead manager while waiting, which triggers a relaunch;
+   - a dead manager while waiting, which triggers a relaunch (issue 7, local-app side);
    - a timeout;
    - `terminate` sent last;
    - cleanup runs on failure.
-7. **Local end to end, without EC2:**
-   1. Start the dev-only `StubManager` (test sources). It reads `NEW_TASK`, downloads the input, writes a summary
-      in the current format, and sends `JOB_DONE`.
+9. **Local end to end, without EC2:**
+   1. Start a dev-only `StubManager` (test sources). It reads `NEW_TASK`, downloads the input, writes a summary in
+      the **Base64 format**, and sends `JOB_DONE`.
    2. Run the local app against it using a locator that doesn't launch, with real S3 and SQS.
    3. Run **two local apps at once** to check that each gets only its own result.
-8. **Blocked on the friend:** a real end-to-end run with the manager on EC2. Fill each gap in its seam as it gets
-   decided.
+10. **Blocked on the friend (issue 8):** the full cloud run (local app → manager on EC2 → workers) on the sample
+    input `words-urls.txt`, with timings for the README.
 
 ## Verification
 - Unit tests for args, config, HTML (escaping), the parser, the locator logic, `UserData.manager`, and the
