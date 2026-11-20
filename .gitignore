@@ -16,6 +16,9 @@ Thumbs.db
 # Local run outputs (e.g. worker-output.txt)
 *-output.txt
 
+# Per-user local app settings (bucket, AMI id); the committed template is local-app.properties.example
+local-app.properties
+
 
 Assignment1.pdf
 .vscode/
@@ -27,3 +30,4 @@ Assignment1.pdf
 credentials
 .env
 claude-session.txt
+output-example.html

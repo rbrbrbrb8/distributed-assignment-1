@@ -8,8 +8,8 @@ import java.util.List;
 import com.distributedsystems.aws.SQSService;
 import com.distributedsystems.worker.download.ImageDownloader;
 import com.distributedsystems.worker.ocr.TesseractOcrEngine;
-import com.distributedsystems.worker.ocr.result.OcrFailure;
-import com.distributedsystems.worker.ocr.result.OcrResult;
+import com.distributedsystems.ocr.result.OcrFailure;
+import com.distributedsystems.ocr.result.OcrResult;
 
 import software.amazon.awssdk.regions.Region;
 

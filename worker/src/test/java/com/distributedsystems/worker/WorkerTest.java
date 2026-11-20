@@ -12,9 +12,9 @@ import org.junit.jupiter.api.Test;
 
 import com.distributedsystems.worker.download.ImageDownloader;
 import com.distributedsystems.worker.ocr.OcrEngine;
-import com.distributedsystems.worker.ocr.result.OcrFailure;
-import com.distributedsystems.worker.ocr.result.OcrResult;
-import com.distributedsystems.worker.ocr.result.OcrSuccess;
+import com.distributedsystems.ocr.result.OcrFailure;
+import com.distributedsystems.ocr.result.OcrResult;
+import com.distributedsystems.ocr.result.OcrSuccess;
 
 /**
  * Tests the Worker's own logic using stubs (fake downloader / fake OCR engine),

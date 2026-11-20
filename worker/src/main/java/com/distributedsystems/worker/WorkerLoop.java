@@ -10,7 +10,7 @@ import java.util.concurrent.TimeUnit;
 import com.distributedsystems.aws.MessageProtocol;
 import com.distributedsystems.aws.MessageProtocol.MessageType;
 import com.distributedsystems.aws.SQSService;
-import com.distributedsystems.worker.ocr.result.OcrResult;
+import com.distributedsystems.ocr.result.OcrResult;
 
 import software.amazon.awssdk.services.sqs.model.Message;
 
