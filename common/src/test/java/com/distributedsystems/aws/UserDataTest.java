@@ -18,6 +18,23 @@ class UserDataTest {
     }
 
     @Test
+    void managerScriptPassesBucketAndWorkerAmiId() {
+        String script = UserData.manager("my-bucket", "jars/manager.jar", "ami-07f5ffe53445e23b1");
+
+        assertTrue(script.contains("/snap/bin/aws s3 cp s3://my-bucket/jars/manager.jar /opt/ocr/manager.jar"));
+        // ManagerMain reads args[0] = bucket, args[1] = worker AMI ID
+        assertTrue(script.contains(
+                "nohup java -jar /opt/ocr/manager.jar my-bucket ami-07f5ffe53445e23b1 >> /var/log/manager.log 2>&1 &"));
+    }
+
+    @Test
+    void managerScriptRejectsUnsafeAmiId() {
+        assertThrows(IllegalArgumentException.class,
+                () -> UserData.manager("my-bucket", "jars/manager.jar", "ami-1; reboot"));
+        assertThrows(IllegalArgumentException.class, () -> UserData.manager("my-bucket", "jars/manager.jar", null));
+    }
+
+    @Test
     void scriptContainsNoCredentials() {
         String script = UserData.worker("my-bucket", "jars/worker.jar").toLowerCase();
 
