@@ -1,4 +1,4 @@
-package com.distributedsystems.worker.ocr.result;
+package com.distributedsystems.ocr.result;
 
 /**
  * Outcome of processing one image URL: either {@link OcrSuccess} (recognized text)

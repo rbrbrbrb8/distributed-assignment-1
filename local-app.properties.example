@@ -1,0 +1,14 @@
+# Settings for the local application.
+# Copy this file to "local-app.properties" (in the directory you run the jar from) and fill in your values.
+# NO credentials here: AWS keys are read by the SDK from ~/.aws/credentials.
+
+# S3 bucket of the system (holds jars/, jobs/<clientId>/, test-data/)
+bucket=ocr-assignment-xxxxxxxx
+
+# AMI the local app uses if it has to start a manager (Ubuntu + Java 21 + Tesseract + AWS CLI)
+amiId=ami-0123456789abcdef0
+
+# Optional (defaults shown)
+region=us-east-1
+waitTimeoutMinutes=60
+managerJarKey=jars/manager.jar

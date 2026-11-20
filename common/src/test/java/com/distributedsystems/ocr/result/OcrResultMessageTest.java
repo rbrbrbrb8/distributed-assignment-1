@@ -1,4 +1,4 @@
-package com.distributedsystems.worker.ocr.result;
+package com.distributedsystems.ocr.result;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

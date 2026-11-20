@@ -1,4 +1,4 @@
-package com.distributedsystems.worker.ocr.result;
+package com.distributedsystems.ocr.result;
 
 import com.distributedsystems.aws.MessageProtocol;
 
