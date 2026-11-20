@@ -47,19 +47,22 @@ credentials in it. AWS credentials come from `~/.aws/credentials` through the SD
    after the client ID so the queue, S3 folder and messages share one ID.
 5. Send `NEW_TASK` to `APP_TO_MANAGER_QUEUE`.
 6. **Wait for `JOB_DONE`** on the response queue with 20 s long polls:
-   - **Every ~60 s, check liveness (issue 7, the user's fix):** if `!managerLocator.isAlive(handle)` and there's
-     no `JOB_DONE` yet, call `ensureAvailableManager` again. The `NEW_TASK` is still in the inbound queue, so the
-     new manager picks it up and no resend is needed.
+   - **Every ~60 s, check liveness (issues 7 and 9):** if `!managerLocator.isAlive(handle)` (the instance is no
+     longer pending/running) and there's no `JOB_DONE` yet, call `ensureAvailableManager` again **and resend the
+     same `NEW_TASK`** (decided 2026-11-20, see `specs/manager-fixes.md` M3). A terminating manager still counts as
+     alive: it finishes the jobs it accepted.
    - **Overall timeout** (configurable, default 60 min), so the app can never hang forever. On timeout it exits
      with a clear error.
 7. Download the summary from the key in `JOB_DONE` (whatever the manager uses, so issue 2 doesn't block this).
 8. `summaryParser.parse(summary)` gives a `List<OcrResult>` (in input order), then `HtmlReport.render(...)` writes
    `outputFileName`.
 9. If `terminate` was given, send `TERMINATE` to `APP_TO_MANAGER_QUEUE` (spec step 17, after the results).
-10. **Cleanup in a `finally` block,** so it also runs on failure:
+   **Also on failure or timeout** (it's in the `finally`), so a failed run doesn't leave paid instances running.
+10. **Cleanup in a `finally` block,** so it also runs on failure. Each step is best effort (a failure is logged and
+    never hides the real error):
     - delete the response queue;
-    - `deletePrefix(jobPrefix(clientId))`;
-    - delete the summary key if it lies outside the job folder (today's `outputs/...`, issue 2).
+    - `deletePrefix(jobPrefix(clientId))`. The summary lives inside the job folder since issue 2 was fixed, so the
+      planned "delete the summary key if it's outside the folder" was dropped.
 
 ### Seams for the open gaps
 | Seam | Implementation now | Gap it isolates | Later change (only here) |
@@ -140,10 +143,14 @@ the stash.
      TODO (issue 10), not part of this step.
    - `isTerminating` stays a TODO (open issue 5).
    - Tests use a stub `EC2Service`.
-8. `LocalApp` orchestration and `LocalAppMain`, with flow tests using stub `SQSService`, `S3Service` and
+8. **(Done 2026-11-20. `LocalAppTest`: 6 tests with an in-memory SQS whose fake "manager" answers `NEW_TASK`.
+   Liveness is checked every 60 s in the jar. The random wait + re-check before relaunching was dropped: the spec
+   lets us assume no launch races, and the locator re-checks anyway. Exit codes: 0 done, 1 run failed, 2 bad
+   arguments/settings.)**
+   `LocalApp` orchestration and `LocalAppMain`, with flow tests using stub `SQSService`, `S3Service` and
    `ManagerLocator`. Covers:
    - the happy path;
-   - a dead manager while waiting, which triggers a relaunch (issue 7, local-app side);
+   - a dead manager while waiting, which triggers a relaunch **and a resend of `NEW_TASK`** (issues 7 and 9);
    - a timeout;
    - `terminate` sent last;
    - cleanup runs on failure.

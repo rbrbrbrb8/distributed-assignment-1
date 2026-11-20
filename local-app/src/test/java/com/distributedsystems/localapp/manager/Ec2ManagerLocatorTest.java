@@ -2,6 +2,7 @@ package com.distributedsystems.localapp.manager;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -93,7 +94,8 @@ class Ec2ManagerLocatorTest {
         assertEquals(new ManagerHandle("i-new1"), handle);
         assertEquals(1, ec2.launchedUserData.size());
         assertTrue(ec2.launchedUserData.get(0).contains("jars/manager.jar"));
-        assertTrue(ec2.launchedUserData.get(0).contains("my-bucket"));
+        // the manager gets bucket and worker AMI as its two arguments (open issue 8)
+        assertTrue(ec2.launchedUserData.get(0).contains("manager.jar my-bucket ami-0123456789abcdef0"));
     }
 
     @Test
@@ -156,6 +158,12 @@ class Ec2ManagerLocatorTest {
 
         ec2.alive.remove("i-m1"); // terminated or crashed
         assertFalse(locator.isAlive(handle));
+    }
+
+    @Test
+    void contractTerminatingManagerIsNoLongerTaggedAsManager() {
+        // The locator relies on findActive(MANAGER) skipping a terminating manager (open issue 5).
+        assertNotEquals(EC2Service.Role.MANAGER.name(), EC2ComputeClient.TERMINATING_ROLE);
     }
 
     @Test

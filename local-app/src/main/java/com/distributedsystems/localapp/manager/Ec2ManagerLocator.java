@@ -20,11 +20,11 @@ import com.distributedsystems.aws.UserData;
  * (the global instance cap is reached), this fails with a clear error. Falling back to the least-loaded full manager
  * is a future TODO (open issue 10), not done on purpose.
  *
- * <p>Known gaps:
- * <ul>
- *   <li>TODO (open issue 5): skip a manager that is terminating; it still looks available today.</li>
- *   <li>Open issue 10: the choice isn't enforced, because {@code NEW_TASK} goes to the shared inbound queue.</li>
- * </ul>
+ * <p>A terminating manager is never chosen (open issue 5): on {@code TERMINATE} it changes its own tag to
+ * {@code Role=TERMINATING_MANAGER}, so {@code findActive(MANAGER)} no longer returns it. {@link #isAlive} still
+ * counts it as alive, on purpose: it finishes the jobs it already accepted, so replacing it would only duplicate work.
+ *
+ * <p>Known gap (open issue 10): the choice isn't enforced, because {@code NEW_TASK} goes to the shared inbound queue.
  */
 public class Ec2ManagerLocator implements ManagerLocator {
 
@@ -79,7 +79,8 @@ public class Ec2ManagerLocator implements ManagerLocator {
     }
 
     private ManagerHandle launchManager() {
-        List<String> launched = ec2.launch(Role.MANAGER, 1, amiId, UserData.manager(bucket, managerJarKey));
+        // One shared AMI: the manager boots from it and starts its workers from it too.
+        List<String> launched = ec2.launch(Role.MANAGER, 1, amiId, UserData.manager(bucket, managerJarKey, amiId));
         if (launched.isEmpty()) {
             throw new IllegalStateException("No manager is available and a new one can't be started: the instance cap ("
                     + EC2Service.MAX_INSTANCES + ") is reached. Try again later.");

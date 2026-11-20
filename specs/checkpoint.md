@@ -57,11 +57,11 @@ a **summary** to S3 and tells the local app, which turns it into an **HTML page*
 ### `manager`: runs on EC2, one instance (the friend's module)
 | Class | Purpose |
 |---|---|
-| `ManagerMain` | Entry point. Reads bucket and worker AMI (env or args), creates queues and clients, starts the engine. |
-| `ManagerEngine` | Two threads: **client listener** (`NEW_TASK`, `TERMINATE`) and **worker listener** (results). Each new job is set up on a thread pool, so jobs are handled in parallel. On `TERMINATE`: stop accepting, finish active jobs, terminate the workers, then itself. |
+| `ManagerMain` | Entry point. Reads bucket and worker AMI (env or args; the boot script passes both), creates queues and clients, starts the engine. |
+| `ManagerEngine` | Two threads: **client listener** (`NEW_TASK`, `TERMINATE`) and **worker listener** (results). Each new job is set up on a thread pool, so jobs are handled in parallel. On `TERMINATE`: re-tag itself `Role=TERMINATING_MANAGER`, stop accepting, finish active jobs, terminate its workers, then itself. Results for clients it never had are left in the queue (they may belong to another manager). |
 | `ClientJob` | State of one client's job: URLs, results by index (duplicates ignored), "is it done?". Builds the **summary**: one line per URL, `url \| OCR: <Base64>` or `url \| ERROR: <Base64>`. |
 | `WorkerScaler` | Needed workers = `ceil(images / n)`, capped at `maxWorkers` (default 8); launches only the missing ones. |
-| `EC2ComputeClient` / `S3StorageClient` | AWS implementations of the engine's `ComputeClient` / `StorageClient` interfaces (so the engine can be tested without AWS). Keeps the manager's **`ActiveClients` tag** up to date. |
+| `EC2ComputeClient` / `S3StorageClient` | AWS implementations of the engine's `ComputeClient` / `StorageClient` interfaces (so the engine can be tested without AWS). Keeps the manager's **`ActiveClients` tag** up to date. Counts and terminates **only the workers this manager launched**. |
 
 ### `local-app`: runs on the user's PC
 | Class | Purpose |
@@ -71,7 +71,7 @@ a **summary** to S3 and tells the local app, which turns it into an **HTML page*
 | `summary.SummaryParser` / `Base64SummaryParser` | Interface plus implementation: summary text → `List<OcrResult>`. Swappable if the format changes. |
 | `HtmlReport` | `List<OcrResult>` → the output HTML (sample layout; a `switch` over the result types; everything escaped). |
 | `manager.ManagerLocator` (+ `ManagerHandle`, `Ec2ManagerLocator`) | Finds an *available* manager (`ActiveClients < manager-clients-n`, missing tag = 0, least loaded first) or starts one; fails clearly at the instance cap. `isAlive` checks that "my" manager is still running. |
-| `LocalApp` / `LocalAppMain` | **TODO (PR 2):** the run flow in section 4, plus the jar's entry point. |
+| `LocalApp` / `LocalAppMain` | The run flow in section 4 (find/start a manager, upload, `NEW_TASK`, wait with liveness checks and resend, HTML, `TERMINATE`, cleanup in `finally`), plus the jar's entry point. |
 
 ## 4. Workflows
 
@@ -100,7 +100,8 @@ a **summary** to S3 and tells the local app, which turns it into an **HTML page*
    4. sends `TERMINATE` if asked;
    5. deletes its queue and its `jobs/<clientId>/` folder.
 
-   (**TODO**: `LocalApp`. While waiting, it checks that its manager is still alive and replaces it if not.)
+   (While waiting, every 60 s, it checks that its manager is still running; if it's gone, it starts a new one and
+   resends `NEW_TASK`. `TERMINATE` and cleanup also run on failure or timeout.)
 
 ### When something fails
 - **Bad image or dead link:** the worker reports `OCR_ERROR` and continues. The HTML shows "link + short error".
@@ -109,12 +110,19 @@ a **summary** to S3 and tells the local app, which turns it into an **HTML page*
 - **Worker is slow but alive:** the heartbeat keeps the task hidden, so it isn't processed twice.
 - **Duplicate results:** the manager ignores a second result for an index it already has.
 - **Results arrive out of order:** the index puts each one on the right line.
-- **Manager dies or shuts down while a client waits:** **TODO** (local-app side of open issue 7). The local app
-  notices and starts a new manager. The waiting `NEW_TASK` is still in the queue.
+- **Manager dies while a client waits (issue 9):** the local app notices the instance is gone,
+  starts a new manager and **resends** `NEW_TASK`. The job restarts from scratch. A duplicate `NEW_TASK` for the
+  same client is harmless: the manager replaces the job, and results are stored by index.
+- **Manager is terminating when a `NEW_TASK` arrives (issue 7):** it doesn't take the task; the task reappears
+  after 30 s. The terminating manager is tagged `Role=TERMINATING_MANAGER`, so no new app picks it. Once it's
+  gone, the waiting app starts a new manager (same rule as above).
+- **Two managers at once (issue 6):** each one leaves the other's results in the queue and only terminates its
+  own workers.
 
 ### Termination
 A local app started with `terminate` sends `TERMINATE` after getting its own results. The manager stops reading
-new jobs, finishes the active ones, terminates all workers, then terminates itself.
+new jobs, re-tags itself `Role=TERMINATING_MANAGER` (so new apps start a new manager instead), finishes the
+active jobs, terminates the workers it launched, then terminates itself.
 
 ## 5. Where things live
 - **S3 bucket** (one per AWS account):
@@ -134,14 +142,14 @@ new jobs, finishes the active ones, terminates all workers, then terminates itse
 | What | Owner | Status |
 |---|---|---|
 | Manager locator (`ManagerLocator`) | user | **DONE** (PR 2, step 7) |
-| Local app run flow (`LocalApp`, `LocalAppMain`) | user | **TODO**, PR 2 step 8 |
+| Local app run flow (`LocalApp`, `LocalAppMain`) | user | **DONE** (PR 2, step 8); real-AWS runs in steps 9–10 |
 | Instance cap 9 in `EC2Service.MAX_INSTANCES` (global) | user | **DONE** (PR 2) |
-| Manager started by the local app gets no worker AMI ID (issue 8) | friend | **TODO**, blocks the full cloud run |
-| A terminating manager still looks available (issue 5) | friend + user | **TODO**, needs a marker (e.g. a tag) |
-| Two managers alive at once clash (issue 6) | open | **TODO** |
-| `TERMINATE` + `NEW_TASK` race, manager side (issue 7) | open | **TODO** (local-app side is in PR 2) |
-| A manager crash loses the job (issue 9) | user (resend) + friend (delete `NEW_TASK` last) | **TODO** |
-| The local app's choice of manager isn't enforced, shared inbound queue (issue 10) | both | **TODO** (preferred fix: a queue per manager) |
+| Manager started by the local app gets no worker AMI ID (issue 8) | user | **DONE** (PR #10, M1) |
+| A terminating manager still looks available (issue 5) | user | **DONE** (PR #10, M2: `Role` tag) |
+| Two managers alive at once clash (issue 6) | user | **DONE** (PR #10, M5) |
+| `TERMINATE` + `NEW_TASK` race (issue 7) | user | **DONE by design** (manager change dropped); local-app side in step 8 |
+| A manager crash loses the job (issue 9) | user | **DONE** (step 8: the local app resends `NEW_TASK`) |
+| The local app's choice of manager isn't enforced, shared inbound queue (issue 10) | both | **OPEN**, accepted limit (fix if ever: a queue per manager) |
 | Fall back to the least-loaded manager when no instance can be launched (issue 10) | user | **Future TODO**, not planned now |
 | README (design answers, AMI/type, timings, n) | both | **TODO** |
 
@@ -150,3 +158,4 @@ new jobs, finishes the active ones, terminates all workers, then terminates itse
 - `specs/s3-service.md`: bucket layout and `S3Service`.
 - `specs/local-app.md`: local-app design and step list.
 - `specs/open-issues.md`: everything still to decide between the local app and the manager.
+- `specs/manager-fixes.md`: the manager fixes M1–M5 (what was done, what was dropped and why).

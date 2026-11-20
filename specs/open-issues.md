@@ -3,19 +3,19 @@
 Status legend: **OPEN** = needs a decision with the friend; **WAITING** = known, the friend is working on it;
 **RESOLVED** = fixed in `main`; **PARTIAL** = partly fixed.
 
-## Status after the friend's manager PR #8 (checked 2026-11-20)
+## Status after the manager fixes PR #10 (checked 2026-11-20; details in `specs/manager-fixes.md`)
 | # | Issue | Status | Local-app follow-up |
 |---|---|---|---|
-| 1 | Summary format loses line boundaries | **RESOLVED** (single-line Base64 entries) | New `Base64SummaryParser` |
+| 1 | Summary format loses line boundaries | **RESOLVED** (single-line Base64 entries) | `Base64SummaryParser` (done) |
 | 2 | Summary location | **RESOLVED** (`S3Service.summaryKey`) | none |
-| 3 | `manager-clients-n` | **PARTIAL** (`ActiveClients` tag) | Locator reads the tag and compares it with `manager-clients-n` |
-| 4 | Manager main / jar / boot script | **PARTIAL** (see issue 8) | Uses `UserData.manager` from `main` |
-| 5 | Terminating manager looks available | **OPEN** | `isTerminating` stays a TODO in the locator |
-| 6 | Two managers alive at once clash | **OPEN** | none |
-| 7 | `TERMINATE` + `NEW_TASK` race strands a job | **OPEN** (manager side) | Local-app side (liveness check while waiting) is in PR 2 |
-| 8 | Manager started by the local app gets no worker AMI ID | **OPEN** (friend's side) | Blocks the full cloud run |
-| 9 | A manager crash loses the job | **OPEN** | Local app resends `NEW_TASK` when it replaces a dead manager (PR 2) |
-| 10 | The local app's choice of manager isn't enforced (shared inbound queue) | **OPEN** | none now; future TODO: fall back to the least-loaded manager when no instance can be launched |
+| 3 | `manager-clients-n` | **RESOLVED** (`ActiveClients` tag + locator) | Locator compares the tag with this run's `manager-clients-n` (done, step 7) |
+| 4 | Manager main / jar / boot script | **RESOLVED** (with issue 8) | none |
+| 5 | Terminating manager looks available | **RESOLVED** (M2: `Role=TERMINATING_MANAGER`) | none: `findActive(MANAGER)` skips it |
+| 6 | Two managers alive at once clash | **RESOLVED** (M5: unknown results kept; own workers only) | none |
+| 7 | `TERMINATE` + `NEW_TASK` race strands a job | **RESOLVED by design** (M4 dropped: the `NEW_TASK` reappears after 30 s) | Step 8: replace a gone manager and resend |
+| 8 | Manager started by the local app gets no worker AMI ID | **RESOLVED** (M1: AMI in the boot script) | `Ec2ManagerLocator` passes `amiId` (done) |
+| 9 | A manager crash loses the job | **RESOLVED by the local app** (M3 dropped) | Step 8: resend `NEW_TASK` when replacing a gone manager |
+| 10 | The local app's choice of manager isn't enforced (shared inbound queue) | **OPEN** (accepted limit) | none now; future TODO: fall back to the least-loaded manager when no instance can be launched |
 
 ## 1. Summary file loses line boundaries (RESOLVED in PR #8)
 - **Resolution:** `ClientJob` now writes one line per image, in input order, separated by `\n`:
