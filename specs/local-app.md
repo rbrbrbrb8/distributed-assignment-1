@@ -154,13 +154,22 @@ the stash.
    - a timeout;
    - `terminate` sent last;
    - cleanup runs on failure.
-9. **Local end to end, without EC2:**
-   1. Start a dev-only `StubManager` (test sources). It reads `NEW_TASK`, downloads the input, writes a summary in
-      the **Base64 format**, and sends `JOB_DONE`.
-   2. Run the local app against it using a locator that doesn't launch, with real S3 and SQS.
-   3. Run **two local apps at once** to check that each gets only its own result.
-10. **Blocked on the friend (issue 8):** the full cloud run (local app → manager on EC2 → workers) on the sample
-    input `words-urls.txt`, with timings for the README.
+9. **(Skipped 2026-11-21: folded into step 10.)** Once the real manager could run on EC2 (PR #10), a stub manager
+   was no longer worth building: the cloud runs in step 10 cover the same checks, including two apps at once.
+10. **(Done 2026-11-21.)** Full cloud runs: local app → manager on EC2 → workers. Watched live through the app's
+    output and a read-only status script polling EC2, SQS and S3 every 15 s (no SSH to the instances).
+    `waitTimeoutMinutes` was set to 10 in `local-app.properties` for the runs.
+
+    | Run | Setup | Result |
+    |---|---|---|
+    | 1 | `words-urls.txt` (2 URLs), `n=1`, `terminate` | Manager started by the app, 2 workers launched by the manager (first real use of `LabRole`), HTML matches the sample's layout. `JOB_DONE` ~1.5 min after the start (cold), everything terminated ~2.5 min after the start. **Found the `ActiveClients` bug (issue 11).** |
+    | 2 | App A (2 URLs, `n=1`), then app B (24 URLs `sample-urls.txt`, `n=6`, `terminate`), `manager-clients-n=2` | Both used the same manager; 2 → 4 workers; each HTML has only its own URLs. A finished before B arrived, so no real overlap. B's 24 images took ~40 s with 4 warm workers. |
+    | 3 | B first (24 URLs, `n=6`), A started once the tag showed 1 (`n=1`, **A** sends `terminate`) | Real overlap: A joined B's manager, tag showed `ActiveClients=2`, `TERMINATE` arrived while B's job ran and the manager finished B (24 results) before terminating. 2 min 18 s in total. |
+
+    In every run, cleanup left no instances, no response queue and an empty `jobs/`. The OCR of the sample's second
+    image reads "3 = a = i ote" where `output-example.html` shows "PEACE": a Tesseract accuracy limit, not a
+    pipeline bug. In `sample-urls.txt`, 12 of 24 links are dead today (HTTP 404, `ConnectException`); they show as
+    link + error, as the spec asks.
 
 ## Verification
 - Unit tests for args, config, HTML (escaping), the parser, the locator logic, `UserData.manager`, and the

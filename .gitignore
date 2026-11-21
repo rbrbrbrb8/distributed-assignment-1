@@ -13,8 +13,10 @@ Thumbs.db
 # Logs
 *.log
 
-# Local run outputs (e.g. worker-output.txt)
+# Local run outputs (e.g. worker-output.txt, words-output.html, out-a.html)
 *-output.txt
+*-output.html
+out-*.html
 
 # Per-user local app settings (bucket, AMI id); the committed template is local-app.properties.example
 local-app.properties

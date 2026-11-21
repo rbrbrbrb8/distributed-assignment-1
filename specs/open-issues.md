@@ -16,6 +16,7 @@ Status legend: **OPEN** = needs a decision with the friend; **WAITING** = known,
 | 8 | Manager started by the local app gets no worker AMI ID | **RESOLVED** (M1: AMI in the boot script) | `Ec2ManagerLocator` passes `amiId` (done) |
 | 9 | A manager crash loses the job | **RESOLVED by the local app** (M3 dropped) | Step 8: resend `NEW_TASK` when replacing a gone manager |
 | 10 | The local app's choice of manager isn't enforced (shared inbound queue) | **OPEN** (accepted limit) | none now; future TODO: fall back to the least-loaded manager when no instance can be launched |
+| 11 | `ActiveClients` tag counts a running job twice | **RESOLVED** (branch `local-app-run`, 2026-11-21) | none |
 
 ## 1. Summary file loses line boundaries (RESOLVED in PR #8)
 - **Resolution:** `ClientJob` now writes one line per image, in input order, separated by `\n`:
@@ -198,3 +199,19 @@ never throws because of the cap: it launches **fewer or none** and returns the I
     issue 10 the job might land on a full manager anyway.
 - **AWS itself refuses** (Academy limits): `runInstances` throws. Keeping our cap at 9 makes our own check stop us
   first.
+
+## 11. The `ActiveClients` tag counts a running job twice (RESOLVED 2026-11-21, found in the first cloud run)
+- **Seen:** one client, but the manager's tag said `ActiveClients=2`.
+- **Cause:** the tag is `activeJobs.size() + pendingJobSetups`. When a job's setup finished, `handleNewTask` added
+  it to `activeJobs` and rewrote the tag while `pendingJobSetups` still counted it (1 + 1 = 2). The `finally` that
+  decrements `pendingJobSetups` rewrote the tag only when the setup **failed**, so after a success the 2 stayed.
+- **Effect:** each manager looked one client fuller than it was. With `manager-clients-n=2`, a second app would
+  have started a new manager instead of joining.
+- **Fix (`ManagerEngine`):** the `finally` always rewrites the tag after decrementing. The tag can still read one
+  too high for the few milliseconds in between, which is the safe direction (at worst an extra manager, never an
+  overloaded one).
+- **Test:** `ManagerLocalTest.activeClientsTagShowsOneWhileOneJobRuns` (fails with `expected: <1> but was: <2>`
+  on the old code). Confirmed on AWS in run 3 of `specs/local-app.md` step 10: the tag showed 1, then 2 with two
+  clients.
+- **Note:** `jars/manager.jar` in S3 was built from `local-app-run` with this fix, so it is ahead of `main` until
+  that branch is merged.

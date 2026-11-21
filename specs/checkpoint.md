@@ -142,7 +142,9 @@ active jobs, terminates the workers it launched, then terminates itself.
 | What | Owner | Status |
 |---|---|---|
 | Manager locator (`ManagerLocator`) | user | **DONE** (PR 2, step 7) |
-| Local app run flow (`LocalApp`, `LocalAppMain`) | user | **DONE** (PR 2, step 8); real-AWS runs in steps 9–10 |
+| Local app run flow (`LocalApp`, `LocalAppMain`) | user | **DONE** (PR 2, step 8) |
+| Full cloud runs, incl. two apps sharing one manager (step 10) | user | **DONE** 2026-11-21 (results and timings in `specs/local-app.md`) |
+| `ActiveClients` tag counted a running job twice (issue 11) | user | **DONE** (PR 2; `manager.jar` in S3 already has the fix) |
 | Instance cap 9 in `EC2Service.MAX_INSTANCES` (global) | user | **DONE** (PR 2) |
 | Manager started by the local app gets no worker AMI ID (issue 8) | user | **DONE** (PR #10, M1) |
 | A terminating manager still looks available (issue 5) | user | **DONE** (PR #10, M2: `Role` tag) |
