@@ -12,6 +12,11 @@ import java.util.Objects;
 public class ManagerMain {
     private static final int DEFAULT_MAX_WORKERS = 8;
     private static final int DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 30;
+    /**
+     * For the two worker queues: matches what WorkerApp asks for and the worker's 60 s heartbeat extension. Whoever
+     * creates a queue first fixes its timeout, and on a fresh account that is the manager (e2e test T10).
+     */
+    private static final int WORKER_QUEUES_VISIBILITY_SECONDS = 60;
 
     static final class ManagerSqsService extends SQSService {
         ManagerSqsService(Region region) {
@@ -35,8 +40,8 @@ public class ManagerMain {
         Ec2Client rawEc2Client = Ec2Client.builder().region(region).build();
 
         String appToManagerUrl = sqsService.getOrCreateQueue(SQSService.APP_TO_MANAGER_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
-        String managerToWorkersUrl = sqsService.getOrCreateQueue(SQSService.MANAGER_TO_WORKERS_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
-        String workersToManagerUrl = sqsService.getOrCreateQueue(SQSService.WORKERS_TO_MANAGER_QUEUE, DEFAULT_VISIBILITY_TIMEOUT_SECONDS);
+        String managerToWorkersUrl = sqsService.getOrCreateQueue(SQSService.MANAGER_TO_WORKERS_QUEUE, WORKER_QUEUES_VISIBILITY_SECONDS);
+        String workersToManagerUrl = sqsService.getOrCreateQueue(SQSService.WORKERS_TO_MANAGER_QUEUE, WORKER_QUEUES_VISIBILITY_SECONDS);
 
         String workerUserData = UserData.worker(bucketName, workerJarKey);
 

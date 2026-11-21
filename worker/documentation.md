@@ -253,13 +253,14 @@ Real-world tests done (see `specs/worker-stage2.md`):
 
 ## 5. Things worth knowing
 
-- **Heartbeat timing vs. the queue's real visibility timeout (to verify).** The heartbeat assumes the task queue
-  hides a message for **at least ~60 s**: its first beat comes 30 s after receiving. But `getOrCreateQueue` keeps
-  the settings of whoever created the queue first, and the manager creates it with **30 s**. If the queue really
-  has 30 s, the first heartbeat races with the expiry: a task that takes more than ~30 s could briefly become
-  visible and be done twice. The result would still be correct (the manager ignores duplicates), only some work
-  is wasted. Check the real value with `aws sqs get-queue-attributes`; a fix would be a shorter first beat, or
-  making the manager create the queue with 60 s.
+- **Heartbeat timing vs. the queue's visibility timeout (verified, fixed).** The heartbeat assumes the task queue
+  hides a message for **at least ~60 s**, because its first beat comes 30 s after receiving.
+  - **The risk:** `getOrCreateQueue` keeps the settings of whoever created the queue first. The manager used to
+    create it with 30 s, which on a fresh account would race with the first heartbeat.
+  - **The fix:** the manager now creates both worker queues with 60 s.
+  - **Our account:** the queues already had 60 s (e2e test T10).
+  - **Duplicates still happen sometimes,** because SQS delivers at least once (e2e test T08 saw one). The manager
+    ignores them.
 - **Workers never stop by themselves.** Only the manager terminates them. If the manager dies, its workers keep
   running (and costing money) until someone terminates them by hand. They do keep processing tasks from the
   shared queue, so they still help a replacement manager, but that manager doesn't know them and won't terminate

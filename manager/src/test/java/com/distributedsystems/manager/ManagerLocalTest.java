@@ -137,8 +137,18 @@ class ManagerLocalTest {
             return batch;
         }
 
+        /** Bodies of the messages handed back with changeMessageVisibility, and the timeout used. */
+        final List<String> released = Collections.synchronizedList(new ArrayList<>());
+        final List<String> deleted = Collections.synchronizedList(new ArrayList<>());
+
         @Override
         public void deleteMessage(String queueUrl, Message message) {
+            deleted.add(message.body());
+        }
+
+        @Override
+        public void changeMessageVisibility(String queueUrl, Message message, int newTimeoutSeconds) {
+            released.add(newTimeoutSeconds + " " + message.body());
         }
     }
 
@@ -343,6 +353,31 @@ class ManagerLocalTest {
 
         // a late duplicate for the finished job is still ours: delete it as before
         assertTrue(engine.handleWorkerResult("client-1", 0, "http://img/a.png", "text", false));
+    }
+
+    @Test
+    @Timeout(10)
+    void unknownResultsAreHandedBackQuicklyAndOwnResultsAreDeleted() throws Exception {
+        // e2e test T07: an idle manager kept another manager's results hidden for the queue's 60 s.
+        InMemorySQSService sqs = new InMemorySQSService();
+        ManagerEngine engine = new ManagerEngine(sqs, new InMemoryStorage(), new InMemoryCompute(), 4,
+                "app-to-manager", "manager-to-workers", "workers-to-manager");
+        Thread managerThread = new Thread(engine::start, "manager-main");
+        managerThread.start();
+
+        String unknown = MessageProtocol.createOcrDoneMsg("someone-else", 0, "http://img/x.png", "text");
+        sqs.sendMessage("workers-to-manager", unknown);
+
+        long deadline = System.currentTimeMillis() + 5000;
+        while (sqs.released.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(List.of(ManagerEngine.UNKNOWN_RESULT_RETRY_SECONDS + " " + unknown), sqs.released);
+        assertFalse(sqs.deleted.contains(unknown)); // never deleted: it may be another manager's
+
+        sqs.sendMessage("app-to-manager", MessageProtocol.createTerminateMsg());
+        managerThread.join(5000);
+        assertFalse(managerThread.isAlive());
     }
 
     @Test

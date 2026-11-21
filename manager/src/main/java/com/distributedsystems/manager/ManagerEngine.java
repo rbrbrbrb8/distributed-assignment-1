@@ -20,6 +20,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ManagerEngine {
     private static final int SQS_BATCH_LIMIT = 10;
     private static final long POLL_ERROR_BACKOFF_MS = 1000;
+    /**
+     * How long a result for an unknown client stays hidden after this manager hands it back. Short, so the manager
+     * that owns it gets it soon (with the queue's 60 s it slowed a busy manager ~4x, e2e test T07); not 0, so an idle
+     * manager doesn't spin on stale results nobody owns.
+     */
+    static final int UNKNOWN_RESULT_RETRY_SECONDS = 5;
 
     private final SQSService sqs;
     private final StorageClient storage;
@@ -207,10 +213,12 @@ public class ManagerEngine {
                     boolean isError = MessageProtocol.MessageType.OCR_ERROR.name().equals(type);
                     String payload = isError ? parts[4] : MessageProtocol.decodeOcrText(parts[4]);
 
-                    // A result for a client we don't know may belong to another manager: leave it in the queue
-                    // (it reappears after the visibility timeout) instead of deleting it.
+                    // A result for a client we don't know may belong to another manager: don't delete it, hand it
+                    // back to the queue after a short delay so its owner can take it.
                     if (handleWorkerResult(clientId, taskIndex, imageUrl, payload, isError)) {
                         sqs.deleteMessage(workersToManagerUrl, msg);
+                    } else {
+                        sqs.changeMessageVisibility(workersToManagerUrl, msg, UNKNOWN_RESULT_RETRY_SECONDS);
                     }
                 } catch (Exception e) {
                     System.err.println("Failed processing worker result: " + e.getMessage());
