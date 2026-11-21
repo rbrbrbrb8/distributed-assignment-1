@@ -345,6 +345,48 @@ class ManagerLocalTest {
         assertTrue(engine.handleWorkerResult("client-1", 0, "http://img/a.png", "text", false));
     }
 
+    @Test
+    @Timeout(10)
+    void activeClientsTagShowsOneWhileOneJobRuns() throws Exception {
+        // Found in the first real run: one client, but the tag said ActiveClients=2 (counted as pending + active).
+        InMemorySQSService sqs = new InMemorySQSService();
+        InMemoryStorage storage = new InMemoryStorage();
+        InMemoryCompute compute = new InMemoryCompute();
+        String inputKey = S3Service.inputKey("client-1");
+        storage.putLines(inputKey, List.of("http://img/a.png"));
+
+        ManagerEngine engine = new ManagerEngine(sqs, storage, compute, 4,
+                "app-to-manager", "manager-to-workers", "workers-to-manager");
+        Thread managerThread = new Thread(engine::start, "manager-main");
+        managerThread.start();
+
+        sqs.sendMessage("app-to-manager", MessageProtocol.createNewTaskMsg("client-1", "resp-1", inputKey, 1));
+        Message task = waitForSingleMessage(sqs, "manager-to-workers"); // the job is set up
+
+        // the last value written while the job runs must settle on 1
+        long deadline = System.currentTimeMillis() + 2000;
+        while (lastActiveClients(compute) != 1 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, lastActiveClients(compute));
+
+        // finish the job and stop the manager
+        String[] parts = MessageProtocol.parse(task.body());
+        sqs.sendMessage("workers-to-manager", MessageProtocol.createOcrDoneMsg("client-1", 0, parts[3], "text"));
+        waitForSingleMessage(sqs, "resp-1");
+        sqs.sendMessage("app-to-manager", MessageProtocol.createTerminateMsg());
+        managerThread.join(5000);
+        assertFalse(managerThread.isAlive());
+        assertEquals(0, lastActiveClients(compute));
+    }
+
+    private static int lastActiveClients(InMemoryCompute compute) {
+        List<Integer> history = compute.activeClientsHistory;
+        synchronized (history) {
+            return history.get(history.size() - 1);
+        }
+    }
+
     private Message waitForSingleMessage(InMemorySQSService sqs, String queueUrl) {
         long deadline = System.currentTimeMillis() + 5000;
         while (System.currentTimeMillis() < deadline) {

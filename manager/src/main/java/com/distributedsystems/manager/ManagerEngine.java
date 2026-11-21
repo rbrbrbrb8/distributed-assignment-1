@@ -127,16 +127,15 @@ public class ManagerEngine {
                         syncActiveClientsTag();
 
                         jobSetupPool.submit(() -> {
-                            boolean addedToActiveJobs = false;
                             try {
-                                addedToActiveJobs = handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
+                                handleNewTask(clientId, responseQueueUrl, s3InputKey, n);
                             } catch (Exception e) {
                                 System.err.println("Failed handling NEW_TASK for client " + clientId + ": " + e.getMessage());
                             } finally {
+                                // The job is no longer "being set up": rewrite the tag, else it counts the job twice
+                                // (pending + active) until the next change.
                                 pendingJobSetups.decrementAndGet();
-                                if (!addedToActiveJobs) {
-                                    syncActiveClientsTag();
-                                }
+                                syncActiveClientsTag();
                             }
                         });
                     }
