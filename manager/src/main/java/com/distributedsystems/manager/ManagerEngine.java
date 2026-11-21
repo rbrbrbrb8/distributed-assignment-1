@@ -153,38 +153,60 @@ public class ManagerEngine {
     }
 
     boolean handleNewTask(String clientId, String responseQueueUrl, String s3InputKey, int n) {
-        List<String> rawLines = storage.downloadLines(s3InputKey);
-        List<String> validUrls = rawLines.stream()
-                .map(String::trim)
-                .filter(line -> !line.isEmpty())
-                .toList();
+        try {
+            List<String> rawLines = storage.downloadLines(s3InputKey);
+            List<String> validUrls = rawLines.stream()
+                    .map(String::trim)
+                    .filter(line -> !line.isEmpty())
+                    .toList();
 
-        ClientJob job = new ClientJob(clientId, responseQueueUrl, n, validUrls);
+            ClientJob job = new ClientJob(clientId, responseQueueUrl, n, validUrls);
 
-        if (job.getTotalTasks() == 0) {
-            completeClientJob(job);
+            if (job.getTotalTasks() == 0) {
+                completeClientJob(job);
+                return false;
+            }
+
+            activeJobs.put(clientId, job);
+            syncActiveClientsTag();
+
+            int launched = scaler.scaleForNewJob(job.getTotalTasks(), n);
+            System.out.printf("[Client %s] Images: %d, n: %d -> Launched %d new workers%n",
+                    clientId, job.getTotalTasks(), n, launched);
+
+            List<String> batch = new ArrayList<>(SQS_BATCH_LIMIT);
+            for (int i = 0; i < validUrls.size(); i++) {
+                batch.add(MessageProtocol.createImageTaskMsg(clientId, i, validUrls.get(i)));
+                if (batch.size() == SQS_BATCH_LIMIT) {
+                    sqs.sendMessagesBatch(managerToWorkersUrl, batch);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                sqs.sendMessagesBatch(managerToWorkersUrl, batch);
+            }
+            return true;
+        } catch (Exception e) {
+            System.err.println("Failed setting up job for client " + clientId + ": " + e.getMessage());
+            activeJobs.remove(clientId);
+            finishedClients.add(clientId);
+            syncActiveClientsTag();
+            failClientJob(clientId, responseQueueUrl, s3InputKey, e);
             return false;
         }
+    }
 
-        activeJobs.put(clientId, job);
-        syncActiveClientsTag();
-
-        int launched = scaler.scaleForNewJob(job.getTotalTasks(), n);
-        System.out.printf("[Client %s] Images: %d, n: %d -> Launched %d new workers%n",
-                clientId, job.getTotalTasks(), n, launched);
-
-        List<String> batch = new ArrayList<>(SQS_BATCH_LIMIT);
-        for (int i = 0; i < validUrls.size(); i++) {
-            batch.add(MessageProtocol.createImageTaskMsg(clientId, i, validUrls.get(i)));
-            if (batch.size() == SQS_BATCH_LIMIT) {
-                sqs.sendMessagesBatch(managerToWorkersUrl, batch);
-                batch.clear();
-            }
+    private void failClientJob(String clientId, String responseQueueUrl, String s3InputKey, Exception cause) {
+        try {
+            String failedTarget = (s3InputKey != null && !s3InputKey.isBlank()) ? s3InputKey : "job-setup";
+            String reason = "Job setup failed: " + cause.getClass().getSimpleName()
+                    + (cause.getMessage() != null ? ": " + cause.getMessage() : "");
+            ClientJob failedJob = new ClientJob(clientId, responseQueueUrl, 1, List.of(failedTarget));
+            failedJob.recordResult(0, failedTarget, reason, true);
+            completeClientJob(failedJob);
+        } catch (Exception notifyError) {
+            System.err.println("Failed notifying client " + clientId + " about setup failure: " + notifyError.getMessage());
         }
-        if (!batch.isEmpty()) {
-            sqs.sendMessagesBatch(managerToWorkersUrl, batch);
-        }
-        return true;
     }
 
     private void pollWorkerResults() {

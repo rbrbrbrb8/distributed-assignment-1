@@ -1,12 +1,17 @@
 package com.distributedsystems.worker;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.awt.image.BufferedImage;
+import java.util.ArrayDeque;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
 
@@ -19,20 +24,29 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.model.Message;
 
 /**
- * Tests WorkerLoop's per-message logic with a stub SQSService that records calls instead of talking to AWS.
+ * Tests WorkerLoop's per-message logic and idle shutdown with a stub SQSService (no network access).
  */
 class WorkerLoopTest {
 
     private static final String TASKS = "tasks-queue";
     private static final String RESULTS = "results-queue";
 
-    /** Stub SQS: records every call as a string, optionally fails on send. No network access. */
+    /** Stub SQS: records every call as a string, optionally fails on send, and serves scripted polls. */
     private static class RecordingSqs extends SQSService {
         final List<String> calls = new CopyOnWriteArrayList<>();
+        final Queue<List<Message>> scriptedPolls = new ArrayDeque<>();
+        Runnable onPoll = () -> {};
         boolean failOnSend = false;
 
         RecordingSqs() {
             super(Region.US_EAST_1); // builds a client object but never uses it
+        }
+
+        @Override
+        public List<Message> receiveMessages(String queueUrl, int maxMessages) {
+            onPoll.run();
+            List<Message> next = scriptedPolls.poll();
+            return next != null ? next : List.of();
         }
 
         @Override
@@ -153,5 +167,50 @@ class WorkerLoopTest {
             Thread.sleep(200);
             assertEquals(callsAfterTask, sqs.calls.size(), "heartbeat kept running after task: " + sqs.calls);
         }
+    }
+
+    @Test
+    void idleLoopShutsDownAfterTimeoutAndResetsTimerWhenWorkArrives() {
+        RecordingSqs sqs = new RecordingSqs();
+        AtomicLong nowMs = new AtomicLong(1_000);
+        AtomicBoolean shutdownTriggered = new AtomicBoolean(false);
+
+        // Poll 1: empty at t=400s (idle 399s < 600s) -> keep running
+        // Poll 2: 1 task arrives at t=500s -> processed, resets idle timer to 500s
+        // Poll 3: empty at t=900s (idle 400s < 600s) -> keep running (would have timed out if timer hadn't reset!)
+        // Poll 4: empty at t=1100s (idle 600s >= 600s) -> trigger self-shutdown and exit loop
+        sqs.scriptedPolls.add(List.of());
+        sqs.scriptedPolls.add(List.of(message(MessageProtocol.createImageTaskMsg("client-1", 0, "http://x/a.png"))));
+        sqs.scriptedPolls.add(List.of());
+        sqs.scriptedPolls.add(List.of());
+
+        long[] pollTimes = { 400_000, 500_000, 900_000, 1_100_000 };
+        int[] pollIdx = { 0 };
+        sqs.onPoll = () -> {
+            int i = pollIdx[0]++;
+            if (i < pollTimes.length) {
+                nowMs.set(pollTimes[i]);
+            }
+        };
+
+        try (WorkerLoop loop = new WorkerLoop(sqs, TASKS, RESULTS, workerReturning("ok"),
+                30_000, 600_000, () -> shutdownTriggered.set(true), nowMs::get)) {
+            loop.run();
+        }
+
+        assertTrue(shutdownTriggered.get(), "expected idle shutdown callback to fire after 600s idle");
+        assertEquals(4, pollIdx[0], "expected exactly 4 polls before loop exited");
+        assertFalse(sqs.calls.isEmpty(), "expected the middle task to be processed");
+    }
+
+    @Test
+    void parseIdleShutdownMinutesDefaultsToZeroWhenUnsetOrInvalid() {
+        assertEquals(0, WorkerApp.parseIdleShutdownMinutes(null));
+        assertEquals(0, WorkerApp.parseIdleShutdownMinutes(""));
+        assertEquals(0, WorkerApp.parseIdleShutdownMinutes("   "));
+        assertEquals(0, WorkerApp.parseIdleShutdownMinutes("-5"));
+        assertEquals(0, WorkerApp.parseIdleShutdownMinutes("abc"));
+        assertEquals(10, WorkerApp.parseIdleShutdownMinutes("10"));
+        assertEquals(10, WorkerApp.parseIdleShutdownMinutes(" 10 "));
     }
 }

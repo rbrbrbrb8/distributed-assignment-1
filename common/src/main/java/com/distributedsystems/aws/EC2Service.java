@@ -15,6 +15,7 @@ import software.amazon.awssdk.services.ec2.model.Instance;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.RunInstancesRequest;
+import software.amazon.awssdk.services.ec2.model.ShutdownBehavior;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.TerminateInstancesRequest;
@@ -83,6 +84,7 @@ public class EC2Service implements AutoCloseable {
                 .maxCount(allowed)
                 .iamInstanceProfile(IamInstanceProfileSpecification.builder().name(INSTANCE_PROFILE).build())
                 .userData(Base64.getEncoder().encodeToString(userDataScript.getBytes(StandardCharsets.UTF_8)))
+                .instanceInitiatedShutdownBehavior(ShutdownBehavior.TERMINATE)
                 .tagSpecifications(tags) // tags are applied atomically at launch
                 .build();
 

@@ -6,6 +6,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 import com.distributedsystems.aws.MessageProtocol;
 import com.distributedsystems.aws.MessageProtocol.MessageType;
@@ -42,21 +43,40 @@ public class WorkerLoop implements AutoCloseable {
     private final String resultsQueueUrl;
     private final Worker worker;
     private final long heartbeatPeriodMs;
+    private final long idleTimeoutMs;
+    private final Runnable onIdleTimeout;
+    private final LongSupplier clockMs;
     private final ScheduledExecutorService heartbeatScheduler;
 
     private volatile boolean running = true;
 
     public WorkerLoop(SQSService sqs, String tasksQueueUrl, String resultsQueueUrl, Worker worker) {
-        this(sqs, tasksQueueUrl, resultsQueueUrl, worker, DEFAULT_HEARTBEAT_PERIOD_MS);
+        this(sqs, tasksQueueUrl, resultsQueueUrl, worker, DEFAULT_HEARTBEAT_PERIOD_MS, 0, () -> {},
+                System::currentTimeMillis);
+    }
+
+    public WorkerLoop(SQSService sqs, String tasksQueueUrl, String resultsQueueUrl, Worker worker,
+            long idleTimeoutMs, Runnable onIdleTimeout) {
+        this(sqs, tasksQueueUrl, resultsQueueUrl, worker, DEFAULT_HEARTBEAT_PERIOD_MS, idleTimeoutMs, onIdleTimeout,
+                System::currentTimeMillis);
     }
 
     /** Package-private: lets tests use a short heartbeat period. */
     WorkerLoop(SQSService sqs, String tasksQueueUrl, String resultsQueueUrl, Worker worker, long heartbeatPeriodMs) {
+        this(sqs, tasksQueueUrl, resultsQueueUrl, worker, heartbeatPeriodMs, 0, () -> {}, System::currentTimeMillis);
+    }
+
+    /** Package-private: lets tests control heartbeat, idle timeout and clock deterministically. */
+    WorkerLoop(SQSService sqs, String tasksQueueUrl, String resultsQueueUrl, Worker worker,
+            long heartbeatPeriodMs, long idleTimeoutMs, Runnable onIdleTimeout, LongSupplier clockMs) {
         this.sqs = sqs;
         this.tasksQueueUrl = tasksQueueUrl;
         this.resultsQueueUrl = resultsQueueUrl;
         this.worker = worker;
         this.heartbeatPeriodMs = heartbeatPeriodMs;
+        this.idleTimeoutMs = idleTimeoutMs;
+        this.onIdleTimeout = onIdleTimeout;
+        this.clockMs = clockMs;
         this.heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "visibility-heartbeat");
             thread.setDaemon(true);
@@ -64,26 +84,48 @@ public class WorkerLoop implements AutoCloseable {
         });
     }
 
-    /** Runs until {@link #stop()} is called. Errors talking to SQS are retried with exponential backoff. */
+    /** Runs until {@link #stop()} is called or the idle timeout expires. */
     public void run() {
-        log("Worker loop started, polling " + tasksQueueUrl);
+        log("Worker loop started, polling " + tasksQueueUrl
+                + (idleTimeoutMs > 0 ? " (idle shutdown after " + idleTimeoutMs + " ms)" : ""));
         long backoffMs = 1_000;
+        long idleSinceMs = clockMs.getAsLong();
         while (running) {
             try {
                 List<Message> messages = sqs.receiveMessages(tasksQueueUrl, 1);
-                for (Message message : messages) {
-                    handle(message);
+                if (messages.isEmpty()) {
+                    if (checkIdleTimeout(idleSinceMs)) {
+                        break;
+                    }
+                } else {
+                    for (Message message : messages) {
+                        handle(message);
+                    }
+                    idleSinceMs = clockMs.getAsLong();
                 }
                 backoffMs = 1_000; // a successful round trip resets the backoff
             } catch (Exception e) {
                 // SQS / network trouble. The current message (if any) was not deleted,
                 // so it will reappear after its visibility timeout - nothing is lost.
                 log("Error in worker loop: " + e + " - retrying in " + backoffMs + " ms");
+                if (checkIdleTimeout(idleSinceMs)) {
+                    break;
+                }
                 sleep(backoffMs);
                 backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
             }
         }
         log("Worker loop stopped");
+    }
+
+    private boolean checkIdleTimeout(long idleSinceMs) {
+        if (idleTimeoutMs > 0 && (clockMs.getAsLong() - idleSinceMs) >= idleTimeoutMs) {
+            log("Worker idle for " + idleTimeoutMs + " ms; initiating self-shutdown");
+            running = false;
+            onIdleTimeout.run();
+            return true;
+        }
+        return false;
     }
 
     /** Asks the loop to finish after the current task (used by the JVM shutdown hook). */
