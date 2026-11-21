@@ -364,12 +364,14 @@ Dev programs in `src/test` that **do** call AWS (run by hand, never by `mvn test
 
 ## 5. Things worth knowing
 
-- **First creator decides the queue settings.** `getOrCreateQueue` never changes an existing queue. The manager
-  creates the worker-task queue with a 30 s visibility timeout, the worker with 60 s, and an old dev test with
-  90 s. Whatever the queue got when it was first created is what it has now. This matters for the worker's
-  heartbeat (see `worker/documentation.md`, section 5). **To verify** with
-  `aws sqs get-queue-attributes --attribute-names VisibilityTimeout` (the AWS session had expired when this was
-  written).
+- **First creator decides the queue settings.** `getOrCreateQueue` never changes an existing queue. Whatever a
+  queue got when it was first created is what it has now.
+  - **The values asked for:** both the manager and the worker ask for **60 s** on the two worker queues. The
+    inbound queue gets 30 s.
+  - **Before the fix:** the manager asked for 30 s on the worker queues, which on a fresh account would have
+    raced with the worker's heartbeat (e2e test T10).
+  - **In our account:** all queues were checked on 2026-11-21. The worker queues are 60 s and the inbound queue is
+    30 s.
 - **The instance cap counts everything in the account**, including instances that have nothing to do with this
   project.
 - **Some methods exist only for dev tools** (`createClientResponseQueue`, `getApproximateMessageCount`,

@@ -100,8 +100,9 @@ If the bucket or AMI is missing, it stops at once (`Objects.requireNonNull`). Th
 
 **Wiring, in order**
 1. Build `S3Service`, `SQSService`, `EC2Service`, and a raw `Ec2Client` (needed to write tags, see 3.6).
-2. Get or create the three fixed queues, each with a **30 s** visibility timeout if the manager is the one that
-   creates them.
+2. Get or create the three fixed queues, if the manager is the one that creates them:
+   - the inbound queue gets a **30 s** visibility timeout;
+   - the two worker queues get **60 s**, matching `WorkerApp` and the worker's heartbeat (e2e test T10).
 3. Prepare the worker boot script once: `UserData.worker(bucket, workerJarKey)`.
 4. Wrap S3 in `S3StorageClient` and EC2 in `EC2ComputeClient`.
 5. Build `ManagerEngine` with `maxWorkers` and the queue URLs, print the configuration, and call `engine.start()`,
@@ -202,12 +203,19 @@ Each round receives up to **10** results. For each:
 |---|---|---|
 | `clientId` is an active job | `job.recordResult(...)`. If that was the last missing line: move the client to `finishedClients`, remove it from `activeJobs`, update the tag, `completeClientJob`. | `true`: delete |
 | `clientId` is in `finishedClients` (a late duplicate after the job was done) | nothing | `true`: delete, so it doesn't circulate |
-| unknown `clientId` | nothing | `false`: **leave it in the queue** |
+| unknown `clientId` | nothing | `false`: **don't delete it**. The listener hands it back with `changeMessageVisibility(msg, 5 s)` |
 
 Why not delete unknown results: during a hand-over, two managers can be alive at once (an old one finishing
 after `TERMINATE`, a new one serving new clients). They share the same results queue. A result one manager doesn't
-know probably belongs to the other one. Leaving it means it reappears after the visibility timeout and the right
-manager takes it. (Before fix M5 it was deleted, and the other manager's job never finished.)
+know probably belongs to the other one, so it is not deleted. (Before fix M5 it was deleted, and the other manager's
+job never finished.)
+
+Why it is handed back after **5 s** (`UNKNOWN_RESULT_RETRY_SECONDS`):
+- **Before:** the result was simply left alone, so it stayed hidden for the queue's 60 s visibility timeout. In
+  e2e test T07, an idle manager kept hiding a busy manager's results this way, and the busy manager's job took
+  **9 min instead of ~2**.
+- **With 5 s:** the owner gets the result within seconds. The same run took **2 min 9 s** (T07b).
+- **Why not 0:** an idle manager would spin non-stop on stale results that nobody owns.
 
 #### Delivering: `completeClientJob(job)`
 1. Upload `job.buildSummaryContent()` to `jobs/<clientId>/summary.txt` (`S3Service.summaryKey`).
@@ -367,7 +375,9 @@ These are candidates for the edge-case test round.
 - **The choice of manager isn't enforced (issue 10).** All managers read the same inbound queue, so a "full"
   manager may still take a new client's `NEW_TASK`.
 - **Results circulate during hand-overs.** A result for a client no manager owns stays in the queue until SQS's
-  retention period (4 days by default) drops it. Rare and cheap.
+  retention period (4 days by default) drops it. In e2e tests T06 and T08 this happened with duplicate results
+  that arrived after their manager had ended. A running manager re-reads such results every 5 s. That costs some
+  SQS requests and nothing else.
 - **The summary is written by the worker-listener thread.** While it uploads one job's summary, other results
   wait a moment. Fine at this scale.
 - **Logs** on the instance: `/var/log/ocr-bootstrap.log` and `/var/log/manager.log`.

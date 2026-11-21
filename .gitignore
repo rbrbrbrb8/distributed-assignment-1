@@ -33,3 +33,5 @@ credentials
 .env
 claude-session.txt
 output-example.html
+e2e-tests.md
+e2e-logs/
