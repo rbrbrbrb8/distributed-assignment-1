@@ -9,19 +9,21 @@ import org.junit.jupiter.api.Test;
 class UserDataTest {
 
     @Test
-    void workerScriptDownloadsJarAndStartsIt() {
+    void workerScriptDownloadsJarAndStartsItWithIdleShutdown() {
         String script = UserData.worker("my-bucket", "jars/worker.jar");
 
         assertTrue(script.startsWith("#!/bin/bash\n"), "must start with a shebang line");
         assertTrue(script.contains("/snap/bin/aws s3 cp s3://my-bucket/jars/worker.jar /opt/ocr/worker.jar"));
+        assertTrue(script.contains("export IDLE_SHUTDOWN_MINUTES=" + UserData.WORKER_IDLE_SHUTDOWN_MINUTES + "\n"));
         assertTrue(script.contains("nohup java -jar /opt/ocr/worker.jar >> /var/log/worker.log 2>&1 &"));
     }
 
     @Test
-    void managerScriptPassesBucketAndWorkerAmiId() {
+    void managerScriptPassesBucketAndWorkerAmiIdWithoutIdleShutdown() {
         String script = UserData.manager("my-bucket", "jars/manager.jar", "ami-07f5ffe53445e23b1");
 
         assertTrue(script.contains("/snap/bin/aws s3 cp s3://my-bucket/jars/manager.jar /opt/ocr/manager.jar"));
+        assertFalse(script.contains("IDLE_SHUTDOWN_MINUTES"), "manager must not self-shutdown on idle");
         // ManagerMain reads args[0] = bucket, args[1] = worker AMI ID
         assertTrue(script.contains(
                 "nohup java -jar /opt/ocr/manager.jar my-bucket ami-07f5ffe53445e23b1 >> /var/log/manager.log 2>&1 &"));

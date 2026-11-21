@@ -4,19 +4,21 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import com.distributedsystems.aws.SQSService;
-import com.distributedsystems.worker.download.ImageDownloader;
-import com.distributedsystems.worker.ocr.TesseractOcrEngine;
 import com.distributedsystems.ocr.result.OcrFailure;
 import com.distributedsystems.ocr.result.OcrResult;
+import com.distributedsystems.worker.download.ImageDownloader;
+import com.distributedsystems.worker.ocr.TesseractOcrEngine;
 
 import software.amazon.awssdk.regions.Region;
 
 /**
  * Entry point of the worker jar. Two modes:
  * <ul>
- *   <li>{@code java -jar worker.jar} — SQS mode (what runs on EC2): consume IMAGE_TASK messages forever.</li>
+ *   <li>{@code java -jar worker.jar} — SQS mode (what runs on EC2): consume IMAGE_TASK messages until terminated
+ *       or until {@code IDLE_SHUTDOWN_MINUTES} elapses with no tasks.</li>
  *   <li>{@code java -jar worker.jar local <url-file>} — debug mode: OCR the URLs in a file and print the results.</li>
  * </ul>
  * Credentials are never configured here: the AWS SDK finds them itself (the IAM role on EC2,
@@ -47,13 +49,17 @@ public final class WorkerApp {
 
     private static void runSqs() {
         Region region = Region.of(System.getenv().getOrDefault("AWS_REGION", "us-east-1"));
+        long idleMinutes = parseIdleShutdownMinutes(System.getenv("IDLE_SHUTDOWN_MINUTES"));
+        long idleTimeoutMs = idleMinutes > 0 ? TimeUnit.MINUTES.toMillis(idleMinutes) : 0;
+        Runnable onIdleTimeout = idleTimeoutMs > 0 ? WorkerApp::shutdownHost : () -> {};
         Worker worker = new Worker(new ImageDownloader(), new TesseractOcrEngine());
 
         try (SQSService sqs = new SQSService(region)) {
             String tasksQueueUrl = sqs.getOrCreateQueue(SQSService.MANAGER_TO_WORKERS_QUEUE, TASK_QUEUE_VISIBILITY_SECONDS);
             String resultsQueueUrl = sqs.getOrCreateQueue(SQSService.WORKERS_TO_MANAGER_QUEUE, TASK_QUEUE_VISIBILITY_SECONDS);
 
-            try (WorkerLoop loop = new WorkerLoop(sqs, tasksQueueUrl, resultsQueueUrl, worker)) {
+            try (WorkerLoop loop = new WorkerLoop(sqs, tasksQueueUrl, resultsQueueUrl, worker,
+                    idleTimeoutMs, onIdleTimeout)) {
                 // On SIGTERM (e.g. the instance is being terminated) let the current task finish cleanly.
                 // If we are killed anyway, the undeleted task simply reappears for another worker.
                 Thread mainThread = Thread.currentThread();
@@ -68,6 +74,28 @@ public final class WorkerApp {
 
                 loop.run();
             }
+        }
+    }
+
+    static long parseIdleShutdownMinutes(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return 0;
+        }
+        try {
+            long value = Long.parseLong(raw.trim());
+            return Math.max(0, value);
+        } catch (NumberFormatException e) {
+            System.err.println("Invalid IDLE_SHUTDOWN_MINUTES='" + raw + "', disabling idle shutdown");
+            return 0;
+        }
+    }
+
+    private static void shutdownHost() {
+        try {
+            System.out.println("Executing OS shutdown due to worker idle timeout...");
+            new ProcessBuilder("shutdown", "-h", "now").inheritIO().start();
+        } catch (IOException e) {
+            System.err.println("Failed to execute shutdown command: " + e.getMessage());
         }
     }
 

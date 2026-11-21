@@ -1,5 +1,6 @@
 package com.distributedsystems.aws;
 
+import java.util.List;
 import java.util.regex.Pattern;
 
 /**
@@ -13,15 +14,17 @@ public final class UserData {
     /** Installed by snap; snap's bin dir is not always on cloud-init's PATH, so use the full path. */
     private static final String AWS_CLI = "/snap/bin/aws";
     private static final String INSTALL_DIR = "/opt/ocr";
+    static final int WORKER_IDLE_SHUTDOWN_MINUTES = 10;
     /** Values are pasted into a shell script, so only allow characters that can't change its meaning. */
     private static final Pattern SAFE = Pattern.compile("[A-Za-z0-9._/-]+");
 
     private UserData() {
     }
 
-    /** Boot script for a worker: run {@code worker.jar} in SQS mode, logging to {@code /var/log/worker.log}. */
+    /** Boot script for a worker: run {@code worker.jar} in SQS mode with a 10-minute idle self-shutdown. */
     public static String worker(String bucket, String jarKey) {
-        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log");
+        return forJar(bucket, jarKey, "worker.jar", "/var/log/worker.log",
+                List.of("export IDLE_SHUTDOWN_MINUTES=" + WORKER_IDLE_SHUTDOWN_MINUTES));
     }
 
     /**
@@ -32,10 +35,11 @@ public final class UserData {
      */
     public static String manager(String bucket, String jarKey, String workerAmiId) {
         requireSafe("workerAmiId", workerAmiId);
-        return forJar(bucket, jarKey, "manager.jar", "/var/log/manager.log", bucket, workerAmiId);
+        return forJar(bucket, jarKey, "manager.jar", "/var/log/manager.log", List.of(), bucket, workerAmiId);
     }
 
-    static String forJar(String bucket, String jarKey, String jarName, String logFile, String... jarArgs) {
+    static String forJar(String bucket, String jarKey, String jarName, String logFile,
+            List<String> extraEnvLines, String... jarArgs) {
         requireSafe("bucket", bucket);
         requireSafe("jarKey", jarKey);
         StringBuilder args = new StringBuilder();
@@ -45,6 +49,7 @@ public final class UserData {
         }
         String jarPath = INSTALL_DIR + "/" + jarName;
         String argSuffix = args.toString();
+        String envBlock = extraEnvLines.isEmpty() ? "" : String.join("\n", extraEnvLines) + "\n";
         return String.join("\n",
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -52,7 +57,9 @@ public final class UserData {
                 "echo \"bootstrap started $(date -u)\"",
                 "mkdir -p " + INSTALL_DIR,
                 AWS_CLI + " s3 cp s3://" + bucket + "/" + jarKey + " " + jarPath + " --only-show-errors",
-                "cd " + INSTALL_DIR,
+                "cd " + INSTALL_DIR)
+                + "\n" + envBlock
+                + String.join("\n",
                 "nohup java -jar " + jarPath + argSuffix + " >> " + logFile + " 2>&1 &",
                 "echo \"started " + jarName + " (pid $!)\"",
                 "");
