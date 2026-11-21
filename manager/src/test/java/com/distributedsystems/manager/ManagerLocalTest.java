@@ -415,6 +415,38 @@ class ManagerLocalTest {
         assertEquals(0, lastActiveClients(compute));
     }
 
+    @Test
+    @Timeout(10)
+    void jobSetupFailureImmediatelySendsJobDoneWithErrorSummary() throws Exception {
+        InMemorySQSService sqs = new InMemorySQSService();
+        InMemoryStorage storage = new InMemoryStorage();
+        InMemoryCompute compute = new InMemoryCompute();
+
+        ManagerEngine engine = new ManagerEngine(sqs, storage, compute, 4,
+                "app-to-manager", "manager-to-workers", "workers-to-manager");
+        Thread managerThread = new Thread(engine::start, "manager-main");
+        managerThread.start();
+
+        String missingKey = S3Service.inputKey("broken-client");
+        sqs.sendMessage("app-to-manager", MessageProtocol.createNewTaskMsg("broken-client", "resp-broken", missingKey, 2));
+
+        Message done = waitForSingleMessage(sqs, "resp-broken");
+        String expectedSummaryKey = S3Service.summaryKey("broken-client");
+        assertEquals(MessageProtocol.createJobDoneMsg(expectedSummaryKey), done.body());
+
+        String summary = storage.getRawContent(expectedSummaryKey);
+        assertNotNull(summary);
+        String[] parts = summary.split(" \\| ERROR: ", 2);
+        assertEquals(missingKey, parts[0]);
+        assertTrue(MessageProtocol.decodeOcrText(parts[1]).contains("Job setup failed"));
+        assertEquals(0, compute.totalLaunched.get());
+
+        sqs.sendMessage("app-to-manager", MessageProtocol.createTerminateMsg());
+        managerThread.join(5000);
+        assertFalse(managerThread.isAlive());
+        assertEquals(0, lastActiveClients(compute));
+    }
+
     private static int lastActiveClients(InMemoryCompute compute) {
         List<Integer> history = compute.activeClientsHistory;
         synchronized (history) {
